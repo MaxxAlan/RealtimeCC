@@ -5,3 +5,4 @@ release/
 .env
 coverage/
 bench-cache/
+preroll-cache/
