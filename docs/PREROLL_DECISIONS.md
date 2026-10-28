@@ -62,3 +62,20 @@ This document records technical decisions, alternatives evaluated, and the ratio
 ## Decision 7: Complete Offline Guarantee for Workers
 - **Decision:** ASR workers (`asr-worker.ts`, `asr-batch-worker.ts`) and translator worker (`translator-worker.mjs`) open no network connections and load no external network resources.
 - **Review:** Grep and code review confirms no `fetch`, `http`, `https`, `dgram`, or socket APIs are utilized in any worker runtime.
+
+---
+
+## Decision 8: ASR Thread Tuning and RTF Measurement on Reference PC
+- **Decision:** Benchmarked Nemotron 3.5 80ms int8 streaming model on reference hardware (`vi.wav`, 4.02s audio):
+  - 10 threads: Decode = 9077 ms, RTF = 2.260 (0.4x real-time; CPU thread contention overhead)
+  - 6 threads: Decode = 5321 ms, RTF = 1.325 (0.8x real-time)
+  - 4 threads: Decode = 4105 ms, RTF = 1.022 (~1.0x real-time)
+- **Conclusion:** 4 threads is optimal on this 6-core/12-thread system for the 80ms model, avoiding core contention and leaving cores for browser/Electron.
+- **Pre-roll RTF Ladder:** To achieve sustained RTF <= 0.5 (>2x faster than speech), larger chunk variants (160ms, 560ms, 1120ms) or GPU execution provider will be selected.
+
+---
+
+## Decision 9: Audio Fetching and Binary Resolution Cascade
+- **Decision:** Binary resolver searches in order: (1) environment variables (`YT_DLP_PATH`, `FFMPEG_PATH`, `FFPROBE_PATH`), (2) bundled app `resources/bin/`, (3) user data `realtimecc/bin/`, (4) WinGet installation directories (`LOCALAPPDATA/Microsoft/WinGet/Packages/yt-dlp*`), and (5) system PATH.
+- **Why:** Enables seamless zero-config detection of locally installed tools on Windows whether installed via winget, choco, scoop, or bundled.
+

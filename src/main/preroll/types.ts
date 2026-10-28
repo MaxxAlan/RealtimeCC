@@ -37,5 +37,6 @@ export type PrerollStatus = {
   underruns: number;
   asrRtf?: number;
   unitsPerSecond?: number;
+  backend?: 'cuda' | 'vulkan' | 'cpu';
   message?: string;
 };
