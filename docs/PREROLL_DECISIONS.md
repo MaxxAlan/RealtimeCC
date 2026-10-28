@@ -47,3 +47,18 @@ This document records technical decisions, alternatives evaluated, and the ratio
   1. *Download full audio file to disk:* Violates privacy guidelines and delays startup time by forcing a multi-minute download before processing begins.
   2. *High-bitrate audio stream:* Wastes network bandwidth and decoder CPU cycles without improving 16 kHz ASR accuracy.
 - **Why:** The user explicitly requested lowest quality audio for fastest processing. Streaming directly from URL to ffmpeg stdout allows processing to commence within seconds of pressing Start.
+
+---
+
+## Decision 6: TranslateGemma 4B GGUF Mirror & SHA-256 Pinning
+- **Decision:** Use Hugging Face repository `42ailab/TranslateGemma-4B-GGUF` at `translategemma-4b-it-Q4_K_M.gguf` with pinned SHA-256 `7f7357c14abd9da4eb200b38b05da502cd6e10d7e1d403fbc9f78c19f3209b72` (size 2,489,909,312 bytes).
+- **Alternatives Considered:**
+  1. *Official Google gated repository `google/translategemma-4b-it`:* Requires Hugging Face login, token management, and model access agreement in browser.
+  2. *Ollama `translategemma:4b`:* Packages vision encoder layers expanding size to 3.3 GB.
+- **Why:** The 42ailab community mirror provides ungated direct downloads of the text-only 4B Q4_K_M weights, perfect for fitting within the 4 GB VRAM headroom of the GTX 1650. SHA-256 is strictly verified on download.
+
+---
+
+## Decision 7: Complete Offline Guarantee for Workers
+- **Decision:** ASR workers (`asr-worker.ts`, `asr-batch-worker.ts`) and translator worker (`translator-worker.mjs`) open no network connections and load no external network resources.
+- **Review:** Grep and code review confirms no `fetch`, `http`, `https`, `dgram`, or socket APIs are utilized in any worker runtime.

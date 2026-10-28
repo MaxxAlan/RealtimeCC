@@ -8,6 +8,10 @@ import { promisify } from 'node:util';
 import { percentile } from './metrics';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { isLiveLanguage, localReadyLanguages, nemotronLanguage, translationLanguages } from './languages';
+import { TranslatorClient } from './preroll/translator-client';
+import { getTranslatorModelPath, isTranslatorModelInstalled, downloadFile, TRANSLATOR_MODEL_INFO } from './preroll/model-manager';
+import { toTranslateGemmaCode, isSupportedPair } from './preroll/translategemma-languages';
+import { LanguageIdentifier } from './preroll/language-id';
 
 type Settings = { model: string; provider: 'local' | 'gemini'; language: string; outputLanguage: string; fontSize: number; opacity: number; historySeconds: number; clickThrough: boolean; hotkey?: string; overlay: { x?: number; y?: number; width: number; height: number } };
 const defaults: Settings = { model: 'nemotron-3.5-asr-streaming-0.6b-80ms-int8', provider: 'local', language: 'auto', outputLanguage: 'same', fontSize: 24, opacity: 82, historySeconds: 8, clickThrough: false, overlay: { width: 760, height: 180 } };
@@ -15,6 +19,9 @@ let mainWindow: BrowserWindow | null = null;
 let overlayWindow: BrowserWindow | null = null;
 let asrWorker: Worker | null = null;
 let localWorkerReady: Promise<void> | null = null;
+let translatorClient: TranslatorClient | null = null;
+let translatorInstallPromise: Promise<void> | null = null;
+const languageId = new LanguageIdentifier(5);
 let liveSession: Awaited<ReturnType<GoogleGenAI['live']['connect']>> | null = null;
 let liveClient: GoogleGenAI | null = null;
 let liveSpeechCaptureAt = 0;
@@ -36,6 +43,8 @@ const geminiKeyPath = () => path.join(app.getPath('userData'), 'gemini-api-key.e
 const modelName = 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-80ms-int8-2026-06-11';
 const modelPath = () => path.join(app.getPath('userData'), 'models', modelName);
 const execFileAsync = promisify(execFile);
+const translatorInstalled = () => isTranslatorModelInstalled(path.join(app.getPath('userData'), 'models'));
+function ensureTranslator(): Promise<void> { if (!translatorClient) translatorClient = new TranslatorClient({ modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')) }); return translatorClient.ready(); }
 function readSettings(): Settings { try { return { ...defaults, ...JSON.parse(fs.readFileSync(settingsPath(), 'utf8')) }; } catch { return defaults; } }
 function hasGeminiKey() { return fs.existsSync(geminiKeyPath()) && safeStorage.isEncryptionAvailable(); }
 function readGeminiKey() { if (!hasGeminiKey()) return ''; return safeStorage.decryptString(fs.readFileSync(geminiKeyPath())); }
@@ -154,7 +163,18 @@ function ensureLocalWorker(language: string): Promise<void> {
       if (message.type === 'processed') { inFlightChunks = Math.max(0, inFlightChunks - 1); broadcast('metrics', { captureToInferenceMs: Math.max(0, message.producedAt - message.capturedAt), inferenceMs: message.inferenceMs, queuedChunks: inFlightChunks, droppedChunks }); if (mediaPreloading) broadcast('media-progress', { currentMs: mediaCurrentMs, durationMs: mediaDurationMs, queuedChunks: inFlightChunks }); }
       if (message.type === 'final' && message.text) {
         if (mediaPreloading) mediaCues.push({ startMs: message.startAt ?? 0, endMs: Math.max(message.endAt ?? 0, (message.startAt ?? 0) + 250), text: message.text });
-        else commitCaption(message.text, message.startAt ?? message.capturedAt ?? Date.now(), message.endAt ?? Date.now());
+        else {
+          const s = readSettings();
+          if (s.provider === 'local' && s.outputLanguage !== 'same' && translatorClient) {
+            const src = s.language !== 'auto' ? (toTranslateGemmaCode(s.language) || 'en') : languageId.vote(message.text);
+            const tgt = toTranslateGemmaCode(s.outputLanguage) || 'vi';
+            const startAt = message.startAt ?? message.capturedAt ?? Date.now(); const endAt = message.endAt ?? Date.now();
+            void translatorClient.translate([{ id: `live-${startAt}`, startMs: startAt, endMs: endAt, text: message.text, src, tgt }]).then((res) => {
+              const out = res[0]?.text || message.text; commitCaption(out, startAt, endAt);
+              broadcast('caption', { final: out, partial: '', captureAt: startAt, producedAt: Date.now(), inferenceMs: 0 });
+            }).catch(() => commitCaption(message.text, startAt, endAt));
+          } else commitCaption(message.text, message.startAt ?? message.capturedAt ?? Date.now(), message.endAt ?? Date.now());
+        }
       }
       if (message.type === 'caption' && running && !mediaPreloading) broadcast('caption', { final: message.partial ? '' : message.text, partial: message.partial ? message.text : '', captureAt: message.captureAt, producedAt: message.producedAt, inferenceMs: message.inferenceMs });
     });
@@ -195,7 +215,7 @@ async function startTranscription() {
     } catch (error) { running = false; liveSession = null; liveClient = null; throw new Error(`Could not connect to Google Live captions: ${error instanceof Error ? error.message : String(error)}`); }
   }
   if (!modelInstalled()) throw new Error('Download the local speech model before starting.');
-  if (settings.outputLanguage !== 'same') throw new Error('Choose Google Live to translate captions into a different language.');
+  if (settings.outputLanguage !== 'same') { if (!translatorInstalled()) throw new Error('Download the local translator model before starting.'); const src = settings.language === 'auto' ? 'en' : (toTranslateGemmaCode(settings.language) || 'en'); const tgt = toTranslateGemmaCode(settings.outputLanguage); if (!tgt || !isSupportedPair(src, tgt)) throw new Error('That language pair is not supported by the local translator.'); await ensureTranslator(); }
   if (settings.language !== 'auto' && !localReadyLanguages.has(settings.language)) throw new Error('That language is not available with the local model. Choose a local-ready language or select Google Live captions.');
   running = true; inFlightChunks = 0; droppedChunks = 0; visibleLatencies = [];
   broadcast('status', { state: 'connecting', message: 'Loading local speech model.' });
@@ -214,10 +234,26 @@ app.whenReady().then(() => {
       if (!sources[0]) { callback({}); return; } callback({ video: sources[0], audio: 'loopback' });
     }).catch(() => callback({}));
   });
-  ipcMain.handle('settings:get', () => ({ ...readSettings(), modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length, audioCapture: 'Windows system loopback (default output)' }));
+  ipcMain.handle('settings:get', () => ({ ...readSettings(), modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length, audioCapture: 'Windows system loopback (default output)' }));
+  ipcMain.handle('translator:status', () => ({ installed: translatorInstalled(), modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')), sizeBytes: TRANSLATOR_MODEL_INFO.sizeBytes, licenseName: TRANSLATOR_MODEL_INFO.licenseName, licenseUrl: TRANSLATOR_MODEL_INFO.licenseUrl }));
+  ipcMain.handle('translator:download', async () => {
+    if (translatorInstalled()) return true;
+    if (translatorInstallPromise) return translatorInstallPromise;
+    translatorInstallPromise = (async () => {
+      const dest = getTranslatorModelPath(path.join(app.getPath('userData'), 'models'));
+      broadcast('translator-progress', { state: 'downloading', received: 0, total: TRANSLATOR_MODEL_INFO.sizeBytes, percent: 0 });
+      try {
+        await downloadFile(TRANSLATOR_MODEL_INFO.url, dest, { expectedSha256: TRANSLATOR_MODEL_INFO.sha256, onProgress: (p) => broadcast('translator-progress', p) });
+        if (readSettings().provider === 'local' && readSettings().outputLanguage !== 'same') await ensureTranslator();
+        broadcast('translator-progress', { state: 'ready', percent: 100 });
+      } catch (e) { broadcast('translator-progress', { state: 'error', message: e instanceof Error ? e.message : String(e) }); throw e; }
+      finally { translatorInstallPromise = null; }
+    })();
+    return translatorInstallPromise;
+  });
   ipcMain.handle('gemini:key:save', (_e, key: unknown) => { if (typeof key !== 'string' || key.trim().length < 20 || key.length > 512) throw new Error('Enter a valid Google AI API key.'); if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows secure storage is unavailable.'); fs.writeFileSync(geminiKeyPath(), safeStorage.encryptString(key.trim()), { mode: 0o600 }); return true; });
   ipcMain.handle('gemini:key:clear', () => { if (fs.existsSync(geminiKeyPath())) fs.unlinkSync(geminiKeyPath()); return true; });
-  ipcMain.handle('settings:save', (_e, patch) => { const valid = validateSettingsPatch(patch); const s = { ...readSettings(), ...valid }; saveSettings(s); if (valid.hotkey && valid.hotkey !== activeHotkey) setHotkey(valid.hotkey); return { ...s, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; });
+  ipcMain.handle('settings:save', (_e, patch) => { const valid = validateSettingsPatch(patch); const s = { ...readSettings(), ...valid }; saveSettings(s); if (valid.hotkey && valid.hotkey !== activeHotkey) setHotkey(valid.hotkey); return { ...s, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; });
   ipcMain.handle('model:download', async () => { await installModel(); if (readSettings().provider === 'local') await ensureLocalWorker(readSettings().language); return true; });
   ipcMain.handle('session:start', async (_e, cloudConsent: unknown) => { if (readSettings().provider === 'gemini' && cloudConsent !== true) throw new Error('Confirm that system audio will be sent to Google before starting.'); if (!running) { sessionCaptions = []; exportCues = []; sessionTimelineStart = Date.now(); } await startTranscription(); return true; }); ipcMain.handle('session:stop', () => { stopTranscription(); return true; });
   ipcMain.handle('session:switch-provider', async (_e, provider: unknown, cloudConsent: unknown) => {
@@ -225,20 +261,27 @@ app.whenReady().then(() => {
     const targetProvider = provider as Settings['provider'];
     if (provider === 'gemini' && cloudConsent !== true) throw new Error('Confirm cloud audio sharing before switching to Google Live.');
     if (mediaPreloading) throw new Error('Wait for media subtitle preparation to finish before switching providers.');
-    const previous = readSettings(); if (previous.provider === targetProvider) return { ...previous, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length };
-    const next: Settings = { ...previous, provider: targetProvider, ...(targetProvider === 'local' && previous.outputLanguage !== 'same' ? { outputLanguage: 'same' } : {}), ...(targetProvider === 'local' && previous.language !== 'auto' && !localReadyLanguages.has(previous.language) ? { language: 'auto' } : {}) };
+    const previous = readSettings(); if (previous.provider === targetProvider) return { ...previous, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length };
+    const next: Settings = { ...previous, provider: targetProvider, ...(targetProvider === 'local' && previous.outputLanguage !== 'same' && !translatorInstalled() ? { outputLanguage: 'same' } : {}), ...(targetProvider === 'local' && previous.language !== 'auto' && !localReadyLanguages.has(previous.language) ? { language: 'auto' } : {}) };
     if (targetProvider === 'local' && !modelInstalled()) throw new Error('Download the local speech model before switching to local recognition.');
+    if (targetProvider === 'local' && next.outputLanguage !== 'same' && !translatorInstalled()) throw new Error('Download the local translator model before switching to local translation.');
     if (targetProvider === 'gemini' && !hasGeminiKey()) throw new Error('Add a Google AI API key before switching to Google Live.');
     const wasRunning = running; if (wasRunning) await stopTranscription(); saveSettings(next);
-    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
+    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
     catch (error) { saveSettings(previous); if (wasRunning) await startTranscription().catch(() => {}); throw error; }
   });
   ipcMain.handle('session:reconfigure', async (_e, patch: unknown) => {
     const valid = validateSettingsPatch(patch); const previous = readSettings(); const next = { ...previous, ...valid };
     if (mediaPreloading) throw new Error('Wait for media subtitle preparation to finish before changing language settings.');
-    if (next.provider === 'local' && next.outputLanguage !== 'same') throw new Error('Local speech recognition does not translate captions.');
+    if (next.provider === 'local' && next.outputLanguage !== 'same') {
+      if (!translatorInstalled()) throw new Error('Download the local translator model before selecting a translated language.');
+      const src = next.language === 'auto' ? 'en' : (toTranslateGemmaCode(next.language) || 'en');
+      const tgt = toTranslateGemmaCode(next.outputLanguage);
+      if (!tgt || !isSupportedPair(src, tgt)) throw new Error('That language pair is not supported by the local translator.');
+      await ensureTranslator();
+    }
     const wasRunning = running; if (wasRunning) await stopTranscription(); saveSettings(next);
-    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
+    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
     catch (error) { saveSettings(previous); if (wasRunning) await startTranscription().catch(() => {}); throw error; }
   });
   ipcMain.handle('captions:export-srt', async () => {
@@ -266,6 +309,15 @@ app.whenReady().then(() => {
     await new Promise((resolve) => setTimeout(resolve, liveSession ? 900 : 0));
     const cues = mediaCues; mediaCues = []; mediaPreloading = false; await stopTranscription();
     if (!cues.length) throw new Error('No speech was detected in this media file. Check that it contains an audio track and try another supported format.');
+    if (readSettings().provider === 'local' && readSettings().outputLanguage !== 'same' && cues.length > 0) {
+      try {
+        await ensureTranslator();
+        const src = readSettings().language !== 'auto' ? (toTranslateGemmaCode(readSettings().language) || 'en') : 'en';
+        const tgt = toTranslateGemmaCode(readSettings().outputLanguage) || 'vi';
+        const res = await translatorClient!.translate(cues.map((c, i) => ({ id: String(i), startMs: c.startMs, endMs: c.endMs, text: c.text, src, tgt })));
+        for (let i = 0; i < cues.length; i++) if (res[i]?.ok) cues[i].text = res[i].text;
+      } catch { /* keep source cues on error */ }
+    }
     exportCues = cues.slice();
     return cues;
   });
@@ -286,4 +338,4 @@ app.whenReady().then(() => {
   if (readSettings().provider === 'local' && modelInstalled()) void ensureLocalWorker(readSettings().language).catch((error) => broadcast('status', { state: 'error', message: `Local model preload failed: ${error instanceof Error ? error.message : String(error)}` }));
   app.on('activate', () => { if (!mainWindow) createWindows(); });
 });
-app.on('before-quit', () => { quitting = true; void stopTranscription(); const worker = asrWorker; asrWorker = null; localWorkerReady = null; if (worker) void worker.terminate(); globalShortcut.unregisterAll(); });
+app.on('before-quit', () => { quitting = true; void stopTranscription(); if (translatorClient) void translatorClient.dispose(); const worker = asrWorker; asrWorker = null; localWorkerReady = null; if (worker) void worker.terminate(); globalShortcut.unregisterAll(); });
