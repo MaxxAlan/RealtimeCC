@@ -95,3 +95,14 @@ export function nemotronLanguage(code: string): string {
   };
   return code === 'auto' ? 'auto' : map[code] ?? 'auto';
 }
+
+export function isTranslateGemmaLanguage(code: string): boolean {
+  const supported = new Set([
+    'ar', 'bg', 'bn', 'ca', 'cs', 'da', 'de', 'el', 'en', 'es', 'et', 'fa', 'fi', 'fil',
+    'fr', 'gu', 'he', 'hi', 'hr', 'hu', 'id', 'is', 'it', 'ja', 'kn', 'ko', 'lt', 'lv',
+    'ml', 'mr', 'nl', 'no', 'pa', 'pl', 'pt-BR', 'pt-PT', 'ro', 'ru', 'sk', 'sl', 'sr',
+    'sv', 'sw', 'ta', 'te', 'th', 'tr', 'uk', 'ur', 'vi', 'zh-Hans', 'zh-Hant', 'zu',
+    'pt', 'zh'
+  ]);
+  return supported.has(code);
+}

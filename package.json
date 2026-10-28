@@ -6,15 +6,19 @@
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
-    "build": "tsc -p tsconfig.main.json && vite build",
+    "build": "tsc -p tsconfig.main.json && node -e \"const fs=require('fs'); fs.mkdirSync('dist/main/preroll', {recursive:true}); fs.copyFileSync('src/main/preroll/translator-worker.mjs', 'dist/main/preroll/translator-worker.mjs');\" && vite build",
     "start": "electron .",
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
     "dist:win": "npm run build && electron-builder --win nsis",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bench:translate": "tsx scripts/bench-translate.ts",
+    "bench:asr": "tsx scripts/bench-asr.ts",
+    "preroll:cli": "tsx scripts/preroll-cli.ts"
   },
   "dependencies": {
     "@google/genai": "^2.31.0",
     "lucide-react": "^0.468.0",
+    "node-llama-cpp": "^3.22.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sherpa-onnx-node": "^2.0.1",
@@ -29,6 +33,7 @@
     "concurrently": "^9.1.2",
     "electron": "^45.0.0",
     "electron-builder": "^26.18.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vite": "^8.3.5",
     "vitest": "^5.0.5",
@@ -45,7 +50,8 @@
       "package.json"
     ],
     "asarUnpack": [
-      "node_modules/sherpa-onnx-node/**/*"
+      "node_modules/sherpa-onnx-node/**/*",
+      "node_modules/node-llama-cpp/**/*"
     ],
     "win": {
       "target": "nsis",

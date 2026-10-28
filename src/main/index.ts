@@ -8,13 +8,77 @@ import { promisify } from 'node:util';
 import { percentile } from './metrics';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { isLiveLanguage, localReadyLanguages, nemotronLanguage, translationLanguages } from './languages';
+import { TranslatorClient } from './preroll/translator-client';
+import { getTranslatorModelPath, isTranslatorModelInstalled, downloadFile, TRANSLATOR_MODEL_INFO } from './preroll/model-manager';
+import { toTranslateGemmaCode, isSupportedPair } from './preroll/translategemma-languages';
+import { LanguageIdentifier } from './preroll/language-id';
+import { PrerollSession } from './preroll/preroll-session';
+import { AsrBatchClient } from './preroll/asr-batch-client';
+import { CueStore } from './preroll/cue-store';
 
-type Settings = { model: string; provider: 'local' | 'gemini'; language: string; outputLanguage: string; fontSize: number; opacity: number; historySeconds: number; clickThrough: boolean; hotkey?: string; overlay: { x?: number; y?: number; width: number; height: number } };
-const defaults: Settings = { model: 'nemotron-3.5-asr-streaming-0.6b-80ms-int8', provider: 'local', language: 'auto', outputLanguage: 'same', fontSize: 24, opacity: 82, historySeconds: 8, clickThrough: false, overlay: { width: 760, height: 180 } };
+export type PrerollSettings = {
+  enabled: boolean;
+  prerollSeconds: number;
+  holdPlaybackUntilReady: boolean;
+  syncOffsetMs: number;
+  displayLeadMs: number;
+  cacheEnabled: boolean;
+};
+
+export type TranslatorSettings = {
+  quant: 'Q4_K_M' | 'Q8_0';
+  gpu: 'auto' | 'off';
+};
+
+type Settings = {
+  model: string;
+  provider: 'local' | 'gemini';
+  language: string;
+  outputLanguage: string;
+  fontSize: number;
+  opacity: number;
+  historySeconds: number;
+  clickThrough: boolean;
+  hotkey?: string;
+  overlay: { x?: number; y?: number; width: number; height: number };
+  preroll: PrerollSettings;
+  translator: TranslatorSettings;
+  asrPrerollVariant: string;
+};
+
+const defaults: Settings = {
+  model: 'nemotron-3.5-asr-streaming-0.6b-80ms-int8',
+  provider: 'local',
+  language: 'auto',
+  outputLanguage: 'same',
+  fontSize: 24,
+  opacity: 82,
+  historySeconds: 8,
+  clickThrough: false,
+  overlay: { width: 760, height: 180 },
+  preroll: {
+    enabled: true,
+    prerollSeconds: 300,
+    holdPlaybackUntilReady: true,
+    syncOffsetMs: 0,
+    displayLeadMs: 0,
+    cacheEnabled: true
+  },
+  translator: {
+    quant: 'Q4_K_M',
+    gpu: 'auto'
+  },
+  asrPrerollVariant: '80ms'
+};
+
 let mainWindow: BrowserWindow | null = null;
 let overlayWindow: BrowserWindow | null = null;
 let asrWorker: Worker | null = null;
 let localWorkerReady: Promise<void> | null = null;
+let translatorClient: TranslatorClient | null = null;
+let translatorInstallPromise: Promise<void> | null = null;
+let prerollSession: PrerollSession | null = null;
+const languageId = new LanguageIdentifier(5);
 let liveSession: Awaited<ReturnType<GoogleGenAI['live']['connect']>> | null = null;
 let liveClient: GoogleGenAI | null = null;
 let liveSpeechCaptureAt = 0;
@@ -36,13 +100,15 @@ const geminiKeyPath = () => path.join(app.getPath('userData'), 'gemini-api-key.e
 const modelName = 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-80ms-int8-2026-06-11';
 const modelPath = () => path.join(app.getPath('userData'), 'models', modelName);
 const execFileAsync = promisify(execFile);
+const translatorInstalled = () => isTranslatorModelInstalled(path.join(app.getPath('userData'), 'models'));
+function ensureTranslator(): Promise<void> { if (!translatorClient) translatorClient = new TranslatorClient({ modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')) }); return translatorClient.ready(); }
 function readSettings(): Settings { try { return { ...defaults, ...JSON.parse(fs.readFileSync(settingsPath(), 'utf8')) }; } catch { return defaults; } }
 function hasGeminiKey() { return fs.existsSync(geminiKeyPath()) && safeStorage.isEncryptionAvailable(); }
 function readGeminiKey() { if (!hasGeminiKey()) return ''; return safeStorage.decryptString(fs.readFileSync(geminiKeyPath())); }
 function saveSettings(value: Settings) { fs.writeFileSync(settingsPath(), JSON.stringify(value, null, 2), { mode: 0o600 }); }
 function validateSettingsPatch(patch: unknown): Partial<Settings> {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid settings update.');
-  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey']);
+  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey', 'preroll', 'translator', 'asrPrerollVariant']);
   if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error('Unsupported settings field.');
   if (value.model !== undefined && value.model !== defaults.model) throw new Error('Unsupported transcription model.');
   if (value.provider !== undefined && value.provider !== 'local' && value.provider !== 'gemini') throw new Error('Unsupported speech provider.');
@@ -53,6 +119,23 @@ function validateSettingsPatch(patch: unknown): Partial<Settings> {
   if (value.historySeconds !== undefined && (typeof value.historySeconds !== 'number' || value.historySeconds < 1 || value.historySeconds > 60)) throw new Error('Caption history must be 1 to 60 seconds.');
   if (value.clickThrough !== undefined && typeof value.clickThrough !== 'boolean') throw new Error('Invalid click-through setting.');
   if (value.hotkey !== undefined && (typeof value.hotkey !== 'string' || value.hotkey.length > 64)) throw new Error('Invalid hotkey.');
+  if (value.preroll !== undefined) {
+    if (!value.preroll || typeof value.preroll !== 'object') throw new Error('Invalid preroll settings.');
+    const p = value.preroll as Record<string, unknown>;
+    if (p.enabled !== undefined && typeof p.enabled !== 'boolean') throw new Error('Preroll enabled must be boolean.');
+    if (p.prerollSeconds !== undefined && (typeof p.prerollSeconds !== 'number' || p.prerollSeconds < 60 || p.prerollSeconds > 1800)) throw new Error('Preroll seconds must be between 60 and 1800.');
+    if (p.holdPlaybackUntilReady !== undefined && typeof p.holdPlaybackUntilReady !== 'boolean') throw new Error('holdPlaybackUntilReady must be boolean.');
+    if (p.syncOffsetMs !== undefined && (typeof p.syncOffsetMs !== 'number' || p.syncOffsetMs < -3000 || p.syncOffsetMs > 3000)) throw new Error('syncOffsetMs must be between -3000 and 3000.');
+    if (p.displayLeadMs !== undefined && (typeof p.displayLeadMs !== 'number' || p.displayLeadMs < 0 || p.displayLeadMs > 300)) throw new Error('displayLeadMs must be between 0 and 300.');
+    if (p.cacheEnabled !== undefined && typeof p.cacheEnabled !== 'boolean') throw new Error('cacheEnabled must be boolean.');
+  }
+  if (value.translator !== undefined) {
+    if (!value.translator || typeof value.translator !== 'object') throw new Error('Invalid translator settings.');
+    const t = value.translator as Record<string, unknown>;
+    if (t.quant !== undefined && t.quant !== 'Q4_K_M' && t.quant !== 'Q8_0') throw new Error('Invalid translator quant.');
+    if (t.gpu !== undefined && t.gpu !== 'auto' && t.gpu !== 'off') throw new Error('Invalid translator gpu setting.');
+  }
+  if (value.asrPrerollVariant !== undefined && typeof value.asrPrerollVariant !== 'string') throw new Error('Invalid ASR preroll variant.');
   return value as Partial<Settings>;
 }
 function broadcast(channel: string, data: unknown) { for (const win of [mainWindow, overlayWindow]) if (win && !win.isDestroyed()) win.webContents.send(channel, data); }
@@ -154,7 +237,18 @@ function ensureLocalWorker(language: string): Promise<void> {
       if (message.type === 'processed') { inFlightChunks = Math.max(0, inFlightChunks - 1); broadcast('metrics', { captureToInferenceMs: Math.max(0, message.producedAt - message.capturedAt), inferenceMs: message.inferenceMs, queuedChunks: inFlightChunks, droppedChunks }); if (mediaPreloading) broadcast('media-progress', { currentMs: mediaCurrentMs, durationMs: mediaDurationMs, queuedChunks: inFlightChunks }); }
       if (message.type === 'final' && message.text) {
         if (mediaPreloading) mediaCues.push({ startMs: message.startAt ?? 0, endMs: Math.max(message.endAt ?? 0, (message.startAt ?? 0) + 250), text: message.text });
-        else commitCaption(message.text, message.startAt ?? message.capturedAt ?? Date.now(), message.endAt ?? Date.now());
+        else {
+          const s = readSettings();
+          if (s.provider === 'local' && s.outputLanguage !== 'same' && translatorClient) {
+            const src = s.language !== 'auto' ? (toTranslateGemmaCode(s.language) || 'en') : languageId.vote(message.text);
+            const tgt = toTranslateGemmaCode(s.outputLanguage) || 'vi';
+            const startAt = message.startAt ?? message.capturedAt ?? Date.now(); const endAt = message.endAt ?? Date.now();
+            void translatorClient.translate([{ id: `live-${startAt}`, startMs: startAt, endMs: endAt, text: message.text, src, tgt }]).then((res) => {
+              const out = res[0]?.text || message.text; commitCaption(out, startAt, endAt);
+              broadcast('caption', { final: out, partial: '', captureAt: startAt, producedAt: Date.now(), inferenceMs: 0 });
+            }).catch(() => commitCaption(message.text, startAt, endAt));
+          } else commitCaption(message.text, message.startAt ?? message.capturedAt ?? Date.now(), message.endAt ?? Date.now());
+        }
       }
       if (message.type === 'caption' && running && !mediaPreloading) broadcast('caption', { final: message.partial ? '' : message.text, partial: message.partial ? message.text : '', captureAt: message.captureAt, producedAt: message.producedAt, inferenceMs: message.inferenceMs });
     });
@@ -195,7 +289,7 @@ async function startTranscription() {
     } catch (error) { running = false; liveSession = null; liveClient = null; throw new Error(`Could not connect to Google Live captions: ${error instanceof Error ? error.message : String(error)}`); }
   }
   if (!modelInstalled()) throw new Error('Download the local speech model before starting.');
-  if (settings.outputLanguage !== 'same') throw new Error('Choose Google Live to translate captions into a different language.');
+  if (settings.outputLanguage !== 'same') { if (!translatorInstalled()) throw new Error('Download the local translator model before starting.'); const src = settings.language === 'auto' ? 'en' : (toTranslateGemmaCode(settings.language) || 'en'); const tgt = toTranslateGemmaCode(settings.outputLanguage); if (!tgt || !isSupportedPair(src, tgt)) throw new Error('That language pair is not supported by the local translator.'); await ensureTranslator(); }
   if (settings.language !== 'auto' && !localReadyLanguages.has(settings.language)) throw new Error('That language is not available with the local model. Choose a local-ready language or select Google Live captions.');
   running = true; inFlightChunks = 0; droppedChunks = 0; visibleLatencies = [];
   broadcast('status', { state: 'connecting', message: 'Loading local speech model.' });
@@ -208,37 +302,169 @@ async function stopTranscription() {
   broadcast('metrics', { droppedChunks, queuedChunks: 0, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99) });
   inFlightChunks = 0; broadcast('status', { state: 'stopped' });
 }
+function getPrerollSession(): PrerollSession {
+  if (prerollSession) return prerollSession;
+  const s = readSettings();
+  const tokenFile = path.join(app.getPath('userData'), 'pairing-token.txt');
+  let token = '';
+  try {
+    if (fs.existsSync(tokenFile)) token = fs.readFileSync(tokenFile, 'utf8').trim();
+  } catch {}
+  if (!token) {
+    const crypto = require('node:crypto');
+    token = crypto.randomBytes(16).toString('hex');
+    try { fs.writeFileSync(tokenFile, token, 'utf8'); } catch {}
+  }
+  const asrBackend = new AsrBatchClient({
+    modelDir: modelPath(),
+    language: nemotronLanguage(s.language)
+  });
+  prerollSession = new PrerollSession({
+    asrBackend,
+    translator: translatorClient || new TranslatorClient({ modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')) }),
+    cacheDir: path.join(app.getPath('userData'), 'preroll-cache'),
+    port: 9876,
+    token,
+    prerollSeconds: s.preroll?.prerollSeconds ?? 300,
+    holdPlaybackUntilReady: s.preroll?.holdPlaybackUntilReady ?? true,
+    syncOffsetMs: s.preroll?.syncOffsetMs ?? 0,
+    displayLeadMs: s.preroll?.displayLeadMs ?? 0,
+    srcLang: s.language !== 'auto' ? (toTranslateGemmaCode(s.language) || 'en') : 'en',
+    tgtLang: s.outputLanguage !== 'same' ? (toTranslateGemmaCode(s.outputLanguage) || 'vi') : 'vi',
+    onCaption: (cap) => broadcast('caption', cap),
+    onStatusChange: (status) => broadcast('preroll-status', status)
+  });
+  return prerollSession;
+}
 app.whenReady().then(() => {
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } }).then((sources) => {
       if (!sources[0]) { callback({}); return; } callback({ video: sources[0], audio: 'loopback' });
     }).catch(() => callback({}));
   });
-  ipcMain.handle('settings:get', () => ({ ...readSettings(), modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length, audioCapture: 'Windows system loopback (default output)' }));
+  ipcMain.handle('settings:get', () => {
+    const session = getPrerollSession();
+    return {
+      ...readSettings(),
+      modelInstalled: modelInstalled(),
+      translatorInstalled: translatorInstalled(),
+      hasGeminiKey: hasGeminiKey(),
+      captionCount: exportCues.length,
+      audioCapture: 'Windows system loopback (default output)',
+      extensionPort: session.bridge.getPort(),
+      extensionToken: session.bridge.getToken(),
+      extensionConnected: session.bridge.isConnected(),
+      activeMedia: session.bridge.getActiveMedia()
+    };
+  });
+  ipcMain.handle('translator:status', () => ({ installed: translatorInstalled(), modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')), sizeBytes: TRANSLATOR_MODEL_INFO.sizeBytes, licenseName: TRANSLATOR_MODEL_INFO.licenseName, licenseUrl: TRANSLATOR_MODEL_INFO.licenseUrl }));
+  ipcMain.handle('translator:download', async () => {
+    if (translatorInstalled()) return true;
+    if (translatorInstallPromise) return translatorInstallPromise;
+    translatorInstallPromise = (async () => {
+      const dest = getTranslatorModelPath(path.join(app.getPath('userData'), 'models'));
+      broadcast('translator-progress', { state: 'downloading', received: 0, total: TRANSLATOR_MODEL_INFO.sizeBytes, percent: 0 });
+      try {
+        await downloadFile(TRANSLATOR_MODEL_INFO.url, dest, { expectedSha256: TRANSLATOR_MODEL_INFO.sha256, onProgress: (p) => broadcast('translator-progress', p) });
+        if (readSettings().provider === 'local' && readSettings().outputLanguage !== 'same') await ensureTranslator();
+        broadcast('translator-progress', { state: 'ready', percent: 100 });
+      } catch (e) { broadcast('translator-progress', { state: 'error', message: e instanceof Error ? e.message : String(e) }); throw e; }
+      finally { translatorInstallPromise = null; }
+    })();
+    return translatorInstallPromise;
+  });
   ipcMain.handle('gemini:key:save', (_e, key: unknown) => { if (typeof key !== 'string' || key.trim().length < 20 || key.length > 512) throw new Error('Enter a valid Google AI API key.'); if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows secure storage is unavailable.'); fs.writeFileSync(geminiKeyPath(), safeStorage.encryptString(key.trim()), { mode: 0o600 }); return true; });
   ipcMain.handle('gemini:key:clear', () => { if (fs.existsSync(geminiKeyPath())) fs.unlinkSync(geminiKeyPath()); return true; });
-  ipcMain.handle('settings:save', (_e, patch) => { const valid = validateSettingsPatch(patch); const s = { ...readSettings(), ...valid }; saveSettings(s); if (valid.hotkey && valid.hotkey !== activeHotkey) setHotkey(valid.hotkey); return { ...s, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; });
+  ipcMain.handle('settings:save', (_e, patch) => { const valid = validateSettingsPatch(patch); const s = { ...readSettings(), ...valid }; saveSettings(s); if (valid.hotkey && valid.hotkey !== activeHotkey) setHotkey(valid.hotkey); return { ...s, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; });
   ipcMain.handle('model:download', async () => { await installModel(); if (readSettings().provider === 'local') await ensureLocalWorker(readSettings().language); return true; });
-  ipcMain.handle('session:start', async (_e, cloudConsent: unknown) => { if (readSettings().provider === 'gemini' && cloudConsent !== true) throw new Error('Confirm that system audio will be sent to Google before starting.'); if (!running) { sessionCaptions = []; exportCues = []; sessionTimelineStart = Date.now(); } await startTranscription(); return true; }); ipcMain.handle('session:stop', () => { stopTranscription(); return true; });
+  ipcMain.handle('session:start', async (_e, cloudConsent: unknown) => {
+    if (readSettings().provider === 'gemini' && cloudConsent !== true) throw new Error('Confirm that system audio will be sent to Google before starting.');
+    const s = readSettings();
+    if (s.provider === 'local' && s.preroll?.enabled) {
+      const session = getPrerollSession();
+      try {
+        if (!translatorInstalled() && s.outputLanguage !== 'same') {
+          throw new Error('Download the local translator model before starting pre-roll translation.');
+        }
+        await ensureTranslator();
+        const startRes = await session.start();
+        if (!startRes.shouldFallback) {
+          running = true;
+          broadcast('status', { state: 'connected', message: 'Smart pre-roll active.' });
+          return { mode: 'preroll' };
+        } else {
+          broadcast('status', { state: 'connecting', message: startRes.reason });
+        }
+      } catch (err) {
+        broadcast('status', { state: 'connecting', message: `Pre-roll unavailable (${err instanceof Error ? err.message : String(err)}). Using live audio capture.` });
+      }
+    }
+    if (!running) { sessionCaptions = []; exportCues = []; sessionTimelineStart = Date.now(); }
+    await startTranscription();
+    return { mode: 'live' };
+  });
+  ipcMain.handle('session:stop', () => {
+    if (prerollSession?.running) prerollSession.stop();
+    stopTranscription();
+    return true;
+  });
+  ipcMain.handle('preroll:start', async () => getPrerollSession().start());
+  ipcMain.handle('preroll:stop', () => { prerollSession?.stop(); return true; });
+  ipcMain.handle('preroll:play-now', () => { prerollSession?.playNow(); return true; });
+  ipcMain.handle('preroll:set-manual-url', (_e, url: unknown) => { getPrerollSession().setManualUrl(typeof url === 'string' && url.trim() ? url.trim() : null); return true; });
+  ipcMain.handle('preroll:set-offset', (_e, offsetMs: unknown) => {
+    if (typeof offsetMs !== 'number') throw new Error('Invalid offset');
+    const session = getPrerollSession();
+    session.cuePlayer.setSyncOffsetMs(offsetMs);
+    const s = readSettings();
+    if (s.preroll) { s.preroll.syncOffsetMs = offsetMs; saveSettings(s); }
+    return offsetMs;
+  });
+  ipcMain.handle('preroll:clear-cache', () => {
+    const cacheDir = path.join(app.getPath('userData'), 'preroll-cache');
+    CueStore.clearCache(cacheDir);
+    return true;
+  });
+  ipcMain.handle('extension:pairing', () => {
+    const session = getPrerollSession();
+    return { port: session.bridge.getPort(), token: session.bridge.getToken(), connected: session.bridge.isConnected() };
+  });
+  ipcMain.handle('preroll:export-srt', async (_e, bilingual: unknown) => {
+    const session = getPrerollSession();
+    if (session.cueStore.allCues.length === 0) return { saved: false, message: 'No pre-rolled subtitles available to export.' };
+    const options = { title: 'Export pre-rolled subtitles', defaultPath: 'preroll-subtitles.srt', filters: [{ name: 'SubRip subtitles', extensions: ['srt'] }] };
+    const result = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return { saved: false, cancelled: true };
+    const content = session.cueStore.exportSrt({ bilingual: Boolean(bilingual) });
+    fs.writeFileSync(result.filePath, content, 'utf8');
+    return { saved: true, filePath: result.filePath };
+  });
   ipcMain.handle('session:switch-provider', async (_e, provider: unknown, cloudConsent: unknown) => {
     if (provider !== 'local' && provider !== 'gemini') throw new Error('Unsupported speech provider.');
     const targetProvider = provider as Settings['provider'];
     if (provider === 'gemini' && cloudConsent !== true) throw new Error('Confirm cloud audio sharing before switching to Google Live.');
     if (mediaPreloading) throw new Error('Wait for media subtitle preparation to finish before switching providers.');
-    const previous = readSettings(); if (previous.provider === targetProvider) return { ...previous, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length };
-    const next: Settings = { ...previous, provider: targetProvider, ...(targetProvider === 'local' && previous.outputLanguage !== 'same' ? { outputLanguage: 'same' } : {}), ...(targetProvider === 'local' && previous.language !== 'auto' && !localReadyLanguages.has(previous.language) ? { language: 'auto' } : {}) };
+    const previous = readSettings(); if (previous.provider === targetProvider) return { ...previous, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length };
+    const next: Settings = { ...previous, provider: targetProvider, ...(targetProvider === 'local' && previous.outputLanguage !== 'same' && !translatorInstalled() ? { outputLanguage: 'same' } : {}), ...(targetProvider === 'local' && previous.language !== 'auto' && !localReadyLanguages.has(previous.language) ? { language: 'auto' } : {}) };
     if (targetProvider === 'local' && !modelInstalled()) throw new Error('Download the local speech model before switching to local recognition.');
+    if (targetProvider === 'local' && next.outputLanguage !== 'same' && !translatorInstalled()) throw new Error('Download the local translator model before switching to local translation.');
     if (targetProvider === 'gemini' && !hasGeminiKey()) throw new Error('Add a Google AI API key before switching to Google Live.');
     const wasRunning = running; if (wasRunning) await stopTranscription(); saveSettings(next);
-    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
+    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
     catch (error) { saveSettings(previous); if (wasRunning) await startTranscription().catch(() => {}); throw error; }
   });
   ipcMain.handle('session:reconfigure', async (_e, patch: unknown) => {
     const valid = validateSettingsPatch(patch); const previous = readSettings(); const next = { ...previous, ...valid };
     if (mediaPreloading) throw new Error('Wait for media subtitle preparation to finish before changing language settings.');
-    if (next.provider === 'local' && next.outputLanguage !== 'same') throw new Error('Local speech recognition does not translate captions.');
+    if (next.provider === 'local' && next.outputLanguage !== 'same') {
+      if (!translatorInstalled()) throw new Error('Download the local translator model before selecting a translated language.');
+      const src = next.language === 'auto' ? 'en' : (toTranslateGemmaCode(next.language) || 'en');
+      const tgt = toTranslateGemmaCode(next.outputLanguage);
+      if (!tgt || !isSupportedPair(src, tgt)) throw new Error('That language pair is not supported by the local translator.');
+      await ensureTranslator();
+    }
     const wasRunning = running; if (wasRunning) await stopTranscription(); saveSettings(next);
-    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
+    try { if (wasRunning) await startTranscription(); return { ...next, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; }
     catch (error) { saveSettings(previous); if (wasRunning) await startTranscription().catch(() => {}); throw error; }
   });
   ipcMain.handle('captions:export-srt', async () => {
@@ -266,6 +492,15 @@ app.whenReady().then(() => {
     await new Promise((resolve) => setTimeout(resolve, liveSession ? 900 : 0));
     const cues = mediaCues; mediaCues = []; mediaPreloading = false; await stopTranscription();
     if (!cues.length) throw new Error('No speech was detected in this media file. Check that it contains an audio track and try another supported format.');
+    if (readSettings().provider === 'local' && readSettings().outputLanguage !== 'same' && cues.length > 0) {
+      try {
+        await ensureTranslator();
+        const src = readSettings().language !== 'auto' ? (toTranslateGemmaCode(readSettings().language) || 'en') : 'en';
+        const tgt = toTranslateGemmaCode(readSettings().outputLanguage) || 'vi';
+        const res = await translatorClient!.translate(cues.map((c, i) => ({ id: String(i), startMs: c.startMs, endMs: c.endMs, text: c.text, src, tgt })));
+        for (let i = 0; i < cues.length; i++) if (res[i]?.ok) cues[i].text = res[i].text;
+      } catch { /* keep source cues on error */ }
+    }
     exportCues = cues.slice();
     return cues;
   });
@@ -283,7 +518,8 @@ app.whenReady().then(() => {
   ipcMain.handle('overlay:bounds', () => overlayWindow?.getBounds()); ipcMain.handle('overlay:move', (_e, x: unknown, y: unknown) => { if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) throw new Error('Invalid position.'); const nearest = screen.getDisplayNearestPoint({ x, y }); const b = overlayWindow!.getBounds(); overlayWindow!.setBounds({ ...b, x: Math.max(nearest.bounds.x - b.width + 80, Math.min(x, nearest.bounds.x + nearest.bounds.width - 80)), y: Math.max(nearest.bounds.y, Math.min(y, nearest.bounds.y + nearest.bounds.height - 50)) }); });
   ipcMain.handle('hotkey:set', (_e, key: unknown) => { if (typeof key !== 'string' || key.length > 64) throw new Error('Invalid hotkey.'); setHotkey(key); return activeHotkey; });
   createWindows(); try { setHotkey(readSettings().hotkey ?? activeHotkey); } catch { /* use default */ }
+  void getPrerollSession().initBridge().catch(() => {});
   if (readSettings().provider === 'local' && modelInstalled()) void ensureLocalWorker(readSettings().language).catch((error) => broadcast('status', { state: 'error', message: `Local model preload failed: ${error instanceof Error ? error.message : String(error)}` }));
   app.on('activate', () => { if (!mainWindow) createWindows(); });
 });
-app.on('before-quit', () => { quitting = true; void stopTranscription(); const worker = asrWorker; asrWorker = null; localWorkerReady = null; if (worker) void worker.terminate(); globalShortcut.unregisterAll(); });
+app.on('before-quit', () => { quitting = true; void stopTranscription(); if (prerollSession) void prerollSession.dispose(); if (translatorClient) void translatorClient.dispose(); const worker = asrWorker; asrWorker = null; localWorkerReady = null; if (worker) void worker.terminate(); globalShortcut.unregisterAll(); });
