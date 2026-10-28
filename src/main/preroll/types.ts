@@ -39,4 +39,7 @@ export type PrerollStatus = {
   unitsPerSecond?: number;
   backend?: 'cuda' | 'vulkan' | 'cpu';
   message?: string;
+  activeMedia?: any;
+  extensionConnected?: boolean;
+  manualUrl?: string | null;
 };

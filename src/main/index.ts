@@ -12,15 +12,72 @@ import { TranslatorClient } from './preroll/translator-client';
 import { getTranslatorModelPath, isTranslatorModelInstalled, downloadFile, TRANSLATOR_MODEL_INFO } from './preroll/model-manager';
 import { toTranslateGemmaCode, isSupportedPair } from './preroll/translategemma-languages';
 import { LanguageIdentifier } from './preroll/language-id';
+import { PrerollSession } from './preroll/preroll-session';
+import { AsrBatchClient } from './preroll/asr-batch-client';
+import { CueStore } from './preroll/cue-store';
 
-type Settings = { model: string; provider: 'local' | 'gemini'; language: string; outputLanguage: string; fontSize: number; opacity: number; historySeconds: number; clickThrough: boolean; hotkey?: string; overlay: { x?: number; y?: number; width: number; height: number } };
-const defaults: Settings = { model: 'nemotron-3.5-asr-streaming-0.6b-80ms-int8', provider: 'local', language: 'auto', outputLanguage: 'same', fontSize: 24, opacity: 82, historySeconds: 8, clickThrough: false, overlay: { width: 760, height: 180 } };
+export type PrerollSettings = {
+  enabled: boolean;
+  prerollSeconds: number;
+  holdPlaybackUntilReady: boolean;
+  syncOffsetMs: number;
+  displayLeadMs: number;
+  cacheEnabled: boolean;
+};
+
+export type TranslatorSettings = {
+  quant: 'Q4_K_M' | 'Q8_0';
+  gpu: 'auto' | 'off';
+};
+
+type Settings = {
+  model: string;
+  provider: 'local' | 'gemini';
+  language: string;
+  outputLanguage: string;
+  fontSize: number;
+  opacity: number;
+  historySeconds: number;
+  clickThrough: boolean;
+  hotkey?: string;
+  overlay: { x?: number; y?: number; width: number; height: number };
+  preroll: PrerollSettings;
+  translator: TranslatorSettings;
+  asrPrerollVariant: string;
+};
+
+const defaults: Settings = {
+  model: 'nemotron-3.5-asr-streaming-0.6b-80ms-int8',
+  provider: 'local',
+  language: 'auto',
+  outputLanguage: 'same',
+  fontSize: 24,
+  opacity: 82,
+  historySeconds: 8,
+  clickThrough: false,
+  overlay: { width: 760, height: 180 },
+  preroll: {
+    enabled: true,
+    prerollSeconds: 300,
+    holdPlaybackUntilReady: true,
+    syncOffsetMs: 0,
+    displayLeadMs: 0,
+    cacheEnabled: true
+  },
+  translator: {
+    quant: 'Q4_K_M',
+    gpu: 'auto'
+  },
+  asrPrerollVariant: '80ms'
+};
+
 let mainWindow: BrowserWindow | null = null;
 let overlayWindow: BrowserWindow | null = null;
 let asrWorker: Worker | null = null;
 let localWorkerReady: Promise<void> | null = null;
 let translatorClient: TranslatorClient | null = null;
 let translatorInstallPromise: Promise<void> | null = null;
+let prerollSession: PrerollSession | null = null;
 const languageId = new LanguageIdentifier(5);
 let liveSession: Awaited<ReturnType<GoogleGenAI['live']['connect']>> | null = null;
 let liveClient: GoogleGenAI | null = null;
@@ -51,7 +108,7 @@ function readGeminiKey() { if (!hasGeminiKey()) return ''; return safeStorage.de
 function saveSettings(value: Settings) { fs.writeFileSync(settingsPath(), JSON.stringify(value, null, 2), { mode: 0o600 }); }
 function validateSettingsPatch(patch: unknown): Partial<Settings> {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid settings update.');
-  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey']);
+  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey', 'preroll', 'translator', 'asrPrerollVariant']);
   if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error('Unsupported settings field.');
   if (value.model !== undefined && value.model !== defaults.model) throw new Error('Unsupported transcription model.');
   if (value.provider !== undefined && value.provider !== 'local' && value.provider !== 'gemini') throw new Error('Unsupported speech provider.');
@@ -62,6 +119,23 @@ function validateSettingsPatch(patch: unknown): Partial<Settings> {
   if (value.historySeconds !== undefined && (typeof value.historySeconds !== 'number' || value.historySeconds < 1 || value.historySeconds > 60)) throw new Error('Caption history must be 1 to 60 seconds.');
   if (value.clickThrough !== undefined && typeof value.clickThrough !== 'boolean') throw new Error('Invalid click-through setting.');
   if (value.hotkey !== undefined && (typeof value.hotkey !== 'string' || value.hotkey.length > 64)) throw new Error('Invalid hotkey.');
+  if (value.preroll !== undefined) {
+    if (!value.preroll || typeof value.preroll !== 'object') throw new Error('Invalid preroll settings.');
+    const p = value.preroll as Record<string, unknown>;
+    if (p.enabled !== undefined && typeof p.enabled !== 'boolean') throw new Error('Preroll enabled must be boolean.');
+    if (p.prerollSeconds !== undefined && (typeof p.prerollSeconds !== 'number' || p.prerollSeconds < 60 || p.prerollSeconds > 1800)) throw new Error('Preroll seconds must be between 60 and 1800.');
+    if (p.holdPlaybackUntilReady !== undefined && typeof p.holdPlaybackUntilReady !== 'boolean') throw new Error('holdPlaybackUntilReady must be boolean.');
+    if (p.syncOffsetMs !== undefined && (typeof p.syncOffsetMs !== 'number' || p.syncOffsetMs < -3000 || p.syncOffsetMs > 3000)) throw new Error('syncOffsetMs must be between -3000 and 3000.');
+    if (p.displayLeadMs !== undefined && (typeof p.displayLeadMs !== 'number' || p.displayLeadMs < 0 || p.displayLeadMs > 300)) throw new Error('displayLeadMs must be between 0 and 300.');
+    if (p.cacheEnabled !== undefined && typeof p.cacheEnabled !== 'boolean') throw new Error('cacheEnabled must be boolean.');
+  }
+  if (value.translator !== undefined) {
+    if (!value.translator || typeof value.translator !== 'object') throw new Error('Invalid translator settings.');
+    const t = value.translator as Record<string, unknown>;
+    if (t.quant !== undefined && t.quant !== 'Q4_K_M' && t.quant !== 'Q8_0') throw new Error('Invalid translator quant.');
+    if (t.gpu !== undefined && t.gpu !== 'auto' && t.gpu !== 'off') throw new Error('Invalid translator gpu setting.');
+  }
+  if (value.asrPrerollVariant !== undefined && typeof value.asrPrerollVariant !== 'string') throw new Error('Invalid ASR preroll variant.');
   return value as Partial<Settings>;
 }
 function broadcast(channel: string, data: unknown) { for (const win of [mainWindow, overlayWindow]) if (win && !win.isDestroyed()) win.webContents.send(channel, data); }
@@ -228,13 +302,61 @@ async function stopTranscription() {
   broadcast('metrics', { droppedChunks, queuedChunks: 0, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99) });
   inFlightChunks = 0; broadcast('status', { state: 'stopped' });
 }
+function getPrerollSession(): PrerollSession {
+  if (prerollSession) return prerollSession;
+  const s = readSettings();
+  const tokenFile = path.join(app.getPath('userData'), 'pairing-token.txt');
+  let token = '';
+  try {
+    if (fs.existsSync(tokenFile)) token = fs.readFileSync(tokenFile, 'utf8').trim();
+  } catch {}
+  if (!token) {
+    const crypto = require('node:crypto');
+    token = crypto.randomBytes(16).toString('hex');
+    try { fs.writeFileSync(tokenFile, token, 'utf8'); } catch {}
+  }
+  const asrBackend = new AsrBatchClient({
+    modelDir: modelPath(),
+    language: nemotronLanguage(s.language)
+  });
+  prerollSession = new PrerollSession({
+    asrBackend,
+    translator: translatorClient || new TranslatorClient({ modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')) }),
+    cacheDir: path.join(app.getPath('userData'), 'preroll-cache'),
+    port: 9876,
+    token,
+    prerollSeconds: s.preroll?.prerollSeconds ?? 300,
+    holdPlaybackUntilReady: s.preroll?.holdPlaybackUntilReady ?? true,
+    syncOffsetMs: s.preroll?.syncOffsetMs ?? 0,
+    displayLeadMs: s.preroll?.displayLeadMs ?? 0,
+    srcLang: s.language !== 'auto' ? (toTranslateGemmaCode(s.language) || 'en') : 'en',
+    tgtLang: s.outputLanguage !== 'same' ? (toTranslateGemmaCode(s.outputLanguage) || 'vi') : 'vi',
+    onCaption: (cap) => broadcast('caption', cap),
+    onStatusChange: (status) => broadcast('preroll-status', status)
+  });
+  return prerollSession;
+}
 app.whenReady().then(() => {
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
     desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } }).then((sources) => {
       if (!sources[0]) { callback({}); return; } callback({ video: sources[0], audio: 'loopback' });
     }).catch(() => callback({}));
   });
-  ipcMain.handle('settings:get', () => ({ ...readSettings(), modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length, audioCapture: 'Windows system loopback (default output)' }));
+  ipcMain.handle('settings:get', () => {
+    const session = getPrerollSession();
+    return {
+      ...readSettings(),
+      modelInstalled: modelInstalled(),
+      translatorInstalled: translatorInstalled(),
+      hasGeminiKey: hasGeminiKey(),
+      captionCount: exportCues.length,
+      audioCapture: 'Windows system loopback (default output)',
+      extensionPort: session.bridge.getPort(),
+      extensionToken: session.bridge.getToken(),
+      extensionConnected: session.bridge.isConnected(),
+      activeMedia: session.bridge.getActiveMedia()
+    };
+  });
   ipcMain.handle('translator:status', () => ({ installed: translatorInstalled(), modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')), sizeBytes: TRANSLATOR_MODEL_INFO.sizeBytes, licenseName: TRANSLATOR_MODEL_INFO.licenseName, licenseUrl: TRANSLATOR_MODEL_INFO.licenseUrl }));
   ipcMain.handle('translator:download', async () => {
     if (translatorInstalled()) return true;
@@ -255,7 +377,68 @@ app.whenReady().then(() => {
   ipcMain.handle('gemini:key:clear', () => { if (fs.existsSync(geminiKeyPath())) fs.unlinkSync(geminiKeyPath()); return true; });
   ipcMain.handle('settings:save', (_e, patch) => { const valid = validateSettingsPatch(patch); const s = { ...readSettings(), ...valid }; saveSettings(s); if (valid.hotkey && valid.hotkey !== activeHotkey) setHotkey(valid.hotkey); return { ...s, modelInstalled: modelInstalled(), translatorInstalled: translatorInstalled(), hasGeminiKey: hasGeminiKey(), captionCount: exportCues.length }; });
   ipcMain.handle('model:download', async () => { await installModel(); if (readSettings().provider === 'local') await ensureLocalWorker(readSettings().language); return true; });
-  ipcMain.handle('session:start', async (_e, cloudConsent: unknown) => { if (readSettings().provider === 'gemini' && cloudConsent !== true) throw new Error('Confirm that system audio will be sent to Google before starting.'); if (!running) { sessionCaptions = []; exportCues = []; sessionTimelineStart = Date.now(); } await startTranscription(); return true; }); ipcMain.handle('session:stop', () => { stopTranscription(); return true; });
+  ipcMain.handle('session:start', async (_e, cloudConsent: unknown) => {
+    if (readSettings().provider === 'gemini' && cloudConsent !== true) throw new Error('Confirm that system audio will be sent to Google before starting.');
+    const s = readSettings();
+    if (s.provider === 'local' && s.preroll?.enabled) {
+      const session = getPrerollSession();
+      try {
+        if (!translatorInstalled() && s.outputLanguage !== 'same') {
+          throw new Error('Download the local translator model before starting pre-roll translation.');
+        }
+        await ensureTranslator();
+        const startRes = await session.start();
+        if (!startRes.shouldFallback) {
+          running = true;
+          broadcast('status', { state: 'connected', message: 'Smart pre-roll active.' });
+          return { mode: 'preroll' };
+        } else {
+          broadcast('status', { state: 'connecting', message: startRes.reason });
+        }
+      } catch (err) {
+        broadcast('status', { state: 'connecting', message: `Pre-roll unavailable (${err instanceof Error ? err.message : String(err)}). Using live audio capture.` });
+      }
+    }
+    if (!running) { sessionCaptions = []; exportCues = []; sessionTimelineStart = Date.now(); }
+    await startTranscription();
+    return { mode: 'live' };
+  });
+  ipcMain.handle('session:stop', () => {
+    if (prerollSession?.running) prerollSession.stop();
+    stopTranscription();
+    return true;
+  });
+  ipcMain.handle('preroll:start', async () => getPrerollSession().start());
+  ipcMain.handle('preroll:stop', () => { prerollSession?.stop(); return true; });
+  ipcMain.handle('preroll:play-now', () => { prerollSession?.playNow(); return true; });
+  ipcMain.handle('preroll:set-manual-url', (_e, url: unknown) => { getPrerollSession().setManualUrl(typeof url === 'string' && url.trim() ? url.trim() : null); return true; });
+  ipcMain.handle('preroll:set-offset', (_e, offsetMs: unknown) => {
+    if (typeof offsetMs !== 'number') throw new Error('Invalid offset');
+    const session = getPrerollSession();
+    session.cuePlayer.setSyncOffsetMs(offsetMs);
+    const s = readSettings();
+    if (s.preroll) { s.preroll.syncOffsetMs = offsetMs; saveSettings(s); }
+    return offsetMs;
+  });
+  ipcMain.handle('preroll:clear-cache', () => {
+    const cacheDir = path.join(app.getPath('userData'), 'preroll-cache');
+    CueStore.clearCache(cacheDir);
+    return true;
+  });
+  ipcMain.handle('extension:pairing', () => {
+    const session = getPrerollSession();
+    return { port: session.bridge.getPort(), token: session.bridge.getToken(), connected: session.bridge.isConnected() };
+  });
+  ipcMain.handle('preroll:export-srt', async (_e, bilingual: unknown) => {
+    const session = getPrerollSession();
+    if (session.cueStore.allCues.length === 0) return { saved: false, message: 'No pre-rolled subtitles available to export.' };
+    const options = { title: 'Export pre-rolled subtitles', defaultPath: 'preroll-subtitles.srt', filters: [{ name: 'SubRip subtitles', extensions: ['srt'] }] };
+    const result = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return { saved: false, cancelled: true };
+    const content = session.cueStore.exportSrt({ bilingual: Boolean(bilingual) });
+    fs.writeFileSync(result.filePath, content, 'utf8');
+    return { saved: true, filePath: result.filePath };
+  });
   ipcMain.handle('session:switch-provider', async (_e, provider: unknown, cloudConsent: unknown) => {
     if (provider !== 'local' && provider !== 'gemini') throw new Error('Unsupported speech provider.');
     const targetProvider = provider as Settings['provider'];
@@ -335,7 +518,8 @@ app.whenReady().then(() => {
   ipcMain.handle('overlay:bounds', () => overlayWindow?.getBounds()); ipcMain.handle('overlay:move', (_e, x: unknown, y: unknown) => { if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) throw new Error('Invalid position.'); const nearest = screen.getDisplayNearestPoint({ x, y }); const b = overlayWindow!.getBounds(); overlayWindow!.setBounds({ ...b, x: Math.max(nearest.bounds.x - b.width + 80, Math.min(x, nearest.bounds.x + nearest.bounds.width - 80)), y: Math.max(nearest.bounds.y, Math.min(y, nearest.bounds.y + nearest.bounds.height - 50)) }); });
   ipcMain.handle('hotkey:set', (_e, key: unknown) => { if (typeof key !== 'string' || key.length > 64) throw new Error('Invalid hotkey.'); setHotkey(key); return activeHotkey; });
   createWindows(); try { setHotkey(readSettings().hotkey ?? activeHotkey); } catch { /* use default */ }
+  void getPrerollSession().initBridge().catch(() => {});
   if (readSettings().provider === 'local' && modelInstalled()) void ensureLocalWorker(readSettings().language).catch((error) => broadcast('status', { state: 'error', message: `Local model preload failed: ${error instanceof Error ? error.message : String(error)}` }));
   app.on('activate', () => { if (!mainWindow) createWindows(); });
 });
-app.on('before-quit', () => { quitting = true; void stopTranscription(); if (translatorClient) void translatorClient.dispose(); const worker = asrWorker; asrWorker = null; localWorkerReady = null; if (worker) void worker.terminate(); globalShortcut.unregisterAll(); });
+app.on('before-quit', () => { quitting = true; void stopTranscription(); if (prerollSession) void prerollSession.dispose(); if (translatorClient) void translatorClient.dispose(); const worker = asrWorker; asrWorker = null; localWorkerReady = null; if (worker) void worker.terminate(); globalShortcut.unregisterAll(); });

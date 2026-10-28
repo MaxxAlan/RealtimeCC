@@ -73,7 +73,8 @@ export class PrerollSession {
       token: options.token,
       onTick: (sample) => this.handleBridgeTick(sample),
       onActiveMediaChange: (media) => this.handleActiveMediaChange(media),
-      onEvent: (ev) => this.handleBridgeEvent(ev)
+      onEvent: (ev) => this.handleBridgeEvent(ev),
+      onConnectionChange: () => this.onStatusChange?.(this.getStatus())
     });
   }
 
@@ -83,6 +84,7 @@ export class PrerollSession {
 
   public setManualUrl(url: string | null): void {
     this.manualUrl = url;
+    this.onStatusChange?.(this.getStatus());
   }
 
   public getManualUrl(): string | null {
@@ -147,7 +149,12 @@ export class PrerollSession {
     );
 
     this.scheduler.onStatus((status) => {
-      this.onStatusChange?.(status);
+      this.onStatusChange?.({
+        ...status,
+        activeMedia: this.bridge.getActiveMedia(),
+        extensionConnected: this.bridge.isConnected(),
+        manualUrl: this.manualUrl
+      });
     });
 
     this.scheduler.onGateOpen(() => {
@@ -188,14 +195,17 @@ export class PrerollSession {
   }
 
   public getStatus(): PrerollStatus {
-    if (this.scheduler) {
-      return this.scheduler.getStatus();
-    }
-    return {
-      state: 'idle',
+    const base = this.scheduler ? this.scheduler.getStatus() : {
+      state: 'idle' as const,
       readyAheadMs: 0,
       playheadMs: this.clock.nowMs(),
       underruns: this.cuePlayer.getUnderruns()
+    };
+    return {
+      ...base,
+      activeMedia: this.bridge.getActiveMedia(),
+      extensionConnected: this.bridge.isConnected(),
+      manualUrl: this.manualUrl
     };
   }
 
@@ -235,6 +245,7 @@ export class PrerollSession {
     if (this.scheduler) {
       this.scheduler.updatePlayhead(media.positionMs, media.paused);
     }
+    this.onStatusChange?.(this.getStatus());
   }
 
   private handleBridgeEvent(ev: { tabId: number; name: string; positionMs: number }): void {

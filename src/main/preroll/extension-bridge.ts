@@ -24,6 +24,7 @@ export interface ExtensionBridgeOptions {
   onActiveMediaChange?: (media: ActiveMediaInfo | null) => void;
   onTick?: (sample: ClockSample & { tabId: number; isAd?: boolean }) => void;
   onEvent?: (event: { tabId: number; name: string; positionMs: number }) => void;
+  onConnectionChange?: (connected: boolean) => void;
 }
 
 export class ExtensionBridge {
@@ -38,6 +39,7 @@ export class ExtensionBridge {
   private onActiveMediaChange?: (media: ActiveMediaInfo | null) => void;
   private onTick?: (sample: ClockSample & { tabId: number; isAd?: boolean }) => void;
   private onEvent?: (event: { tabId: number; name: string; positionMs: number }) => void;
+  private onConnectionChange?: (connected: boolean) => void;
 
   constructor(options: ExtensionBridgeOptions = {}) {
     this.port = options.port ?? 9876;
@@ -45,6 +47,7 @@ export class ExtensionBridge {
     this.onActiveMediaChange = options.onActiveMediaChange;
     this.onTick = options.onTick;
     this.onEvent = options.onEvent;
+    this.onConnectionChange = options.onConnectionChange;
   }
 
   public getToken(): string {
@@ -123,6 +126,7 @@ export class ExtensionBridge {
 
         ws.on('close', () => {
           this.authenticatedSockets.delete(ws);
+          this.onConnectionChange?.(this.authenticatedSockets.size > 0);
         });
       });
 
@@ -182,6 +186,7 @@ export class ExtensionBridge {
       if (this.verifyToken(msg.token)) {
         this.authenticatedSockets.add(ws);
         ws.send(JSON.stringify({ type: 'hello-ack', status: 'authenticated' }));
+        this.onConnectionChange?.(true);
       } else {
         ws.close(1008, 'Invalid pairing token');
       }
