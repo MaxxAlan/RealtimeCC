@@ -6,3 +6,8 @@ release/
 coverage/
 bench-cache/
 preroll-cache/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.tar.bz2

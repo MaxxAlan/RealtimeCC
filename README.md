@@ -61,7 +61,39 @@ Both worker-only P50 runs exceed the 500 ms target, and one P95 exceeds 1000 ms.
 
 To produce a valid report, play a timestamped speech fixture through the Windows output device, record its ground-truth word start times, and collect overlay-visible timestamps over repeated runs after model warm-up. Report P50/P95/P99 end-to-end latency, WER, dropped audio chunks and VRAM. Do not substitute an offline model RTF or this worker-only smoke run for end-to-end latency.
 
+## Tuning Nemotron / chunking (do this before changing engines)
+
+The live path currently defaults to the **80 ms** INT8 Nemotron 3.5 streaming model on CPU. Larger chunk variants trade a bit of latency for higher accuracy and lower per-chunk overhead.
+
+Supported variants (downloadable from the app or manually):
+
+| Variant | Model folder suffix | Typical use |
+|---------|---------------------|-------------|
+| 80ms    | `…-80ms-int8-2026-06-11`  | Lowest latency partials (current default) |
+| 160ms   | `…-160ms-int8-2026-06-11` | Balanced |
+| 560ms   | `…-560ms-int8-2026-06-11` | Higher accuracy, good for pre-roll batch |
+| 1120ms  | `…-1120ms-int8-2026-06-11`| Highest accuracy / throughput for offline-style |
+
+**Benchmark (worker-only, streaming simulation):**
+
+```powershell
+# After downloading a model inside the app
+npx tsx scripts/bench-asr.ts --variant 80
+npx tsx scripts/bench-asr.ts --variant 160
+npx tsx scripts/bench-asr.ts --variant 560 --chunk-ms 80
+npx tsx scripts/bench-asr.ts --variant 1120 --threads 4
+```
+
+Reports RTF, first-partial latency, per-chunk inference P50/P95, and simulated drop rate under a live-like 80 ms feed. JSON reports land in `bench-cache/`.
+
+**Settings:** `asrPrerollVariant` accepts `80ms` | `160ms` | `560ms` | `1120ms`. Changing it requires the matching model files; the download path follows the selected variant.
+
+**Queue:** live in-flight limit raised from 8 → 12 chunks to reduce artificial drops while the recognizer is briefly busy.
+
+Only after solid E2E numbers (loopback → overlay paint) on the target machine should CUDA Sherpa or whisper.cpp prototypes be started. Otherwise the bottleneck remains unmeasured.
+
 ## Actual machine inspected
+
 
 - AMD Ryzen 5 5600H
 - NVIDIA GeForce GTX 1650, 4 GB VRAM

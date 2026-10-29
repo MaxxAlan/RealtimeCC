@@ -97,8 +97,18 @@ let visibleLatencies: number[] = [];
 let activeHotkey = 'CommandOrControl+Shift+C';
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
 const geminiKeyPath = () => path.join(app.getPath('userData'), 'gemini-api-key.enc');
-const modelName = 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-80ms-int8-2026-06-11';
-const modelPath = () => path.join(app.getPath('userData'), 'models', modelName);
+const NEMOTRON_VARIANTS: Record<string, string> = {
+  '80ms': 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-80ms-int8-2026-06-11',
+  '160ms': 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-160ms-int8-2026-06-11',
+  '560ms': 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11',
+  '1120ms': 'sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-1120ms-int8-2026-06-11',
+};
+const DEFAULT_VARIANT = '80ms';
+function resolveModelName(variant?: string): string {
+  const key = (variant || DEFAULT_VARIANT).toLowerCase().replace(/\s/g, '');
+  return NEMOTRON_VARIANTS[key] || NEMOTRON_VARIANTS[DEFAULT_VARIANT];
+}
+const modelPath = (variant?: string) => path.join(app.getPath('userData'), 'models', resolveModelName(variant || readSettings().asrPrerollVariant || DEFAULT_VARIANT));
 const execFileAsync = promisify(execFile);
 const translatorInstalled = () => isTranslatorModelInstalled(path.join(app.getPath('userData'), 'models'));
 function ensureTranslator(): Promise<void> { if (!translatorClient) translatorClient = new TranslatorClient({ modelPath: getTranslatorModelPath(path.join(app.getPath('userData'), 'models')) }); return translatorClient.ready(); }
@@ -135,7 +145,7 @@ function validateSettingsPatch(patch: unknown): Partial<Settings> {
     if (t.quant !== undefined && t.quant !== 'Q4_K_M' && t.quant !== 'Q8_0') throw new Error('Invalid translator quant.');
     if (t.gpu !== undefined && t.gpu !== 'auto' && t.gpu !== 'off') throw new Error('Invalid translator gpu setting.');
   }
-  if (value.asrPrerollVariant !== undefined && typeof value.asrPrerollVariant !== 'string') throw new Error('Invalid ASR preroll variant.');
+  if (value.asrPrerollVariant !== undefined) { const v = String(value.asrPrerollVariant).toLowerCase(); if (!['80ms','160ms','560ms','1120ms'].includes(v)) throw new Error('ASR variant must be 80ms, 160ms, 560ms or 1120ms.'); value.asrPrerollVariant = v; }
   return value as Partial<Settings>;
 }
 function broadcast(channel: string, data: unknown) { for (const win of [mainWindow, overlayWindow]) if (win && !win.isDestroyed()) win.webContents.send(channel, data); }
@@ -174,7 +184,7 @@ function setHotkey(accelerator: string) {
   const ok = globalShortcut.register(accelerator, () => { if (overlayWindow?.isVisible()) overlayWindow.hide(); else overlayWindow?.show(); });
   if (!ok) { activeHotkey = 'CommandOrControl+Shift+C'; globalShortcut.register(activeHotkey, () => overlayWindow?.isVisible() ? overlayWindow.hide() : overlayWindow?.show()); throw new Error('That hotkey is unavailable. Reverted to Ctrl+Shift+C.'); }
 }
-function modelInstalled() { const dir = modelPath(); return ['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'].every((file) => fs.existsSync(path.join(dir, file))); }
+function modelInstalled(variant?: string) { const dir = modelPath(variant); return ['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'].every((file) => fs.existsSync(path.join(dir, file))); }
 function download(url: string, destination: string, redirects = 0): Promise<void> {
   return new Promise((resolve, reject) => {
     if (redirects > 8) return reject(new Error('Model download redirected too many times.'));
@@ -192,20 +202,23 @@ function download(url: string, destination: string, redirects = 0): Promise<void
   });
 }
 let modelInstallPromise: Promise<void> | null = null;
-function installModel(): Promise<void> {
-  if (modelInstalled()) return Promise.resolve();
+function installModel(variant?: string): Promise<void> {
+  const v = variant || readSettings().asrPrerollVariant || DEFAULT_VARIANT;
+  if (modelInstalled(v)) return Promise.resolve();
   if (modelInstallPromise) return modelInstallPromise;
   modelInstallPromise = (async () => {
-    const modelRoot = path.dirname(modelPath()); fs.mkdirSync(modelRoot, { recursive: true });
-    const archive = path.join(modelRoot, `${modelName}.tar.bz2`);
-    broadcast('model-progress', { state: 'downloading', received: 0, total: 0, percent: null });
+    const name = resolveModelName(v);
+    const modelRoot = path.dirname(modelPath(v)); fs.mkdirSync(modelRoot, { recursive: true });
+    const archive = path.join(modelRoot, `${name}.tar.bz2`);
+    broadcast('model-progress', { state: 'downloading', received: 0, total: 0, percent: null, variant: v });
     try {
-      await download(`https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${modelName}.tar.bz2`, archive);
-      broadcast('model-progress', { state: 'extracting', percent: null });
+      await download(`https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${name}.tar.bz2`, archive);
+      broadcast('model-progress', { state: 'extracting', percent: null, variant: v });
       await execFileAsync('tar', ['-xjf', archive, '-C', modelRoot], { windowsHide: true, maxBuffer: 1024 * 1024 });
-      if (!modelInstalled()) throw new Error('The downloaded ASR model is incomplete. Remove the model files and try again.');
-      fs.unlinkSync(archive); broadcast('model-progress', { state: 'ready', percent: 100 });
-    } catch (error) { broadcast('model-progress', { state: 'error', message: error instanceof Error ? error.message : String(error) }); throw error; }
+      if (!modelInstalled(v)) throw new Error('The downloaded ASR model is incomplete. Remove the model files and try again.');
+      try { fs.unlinkSync(archive); } catch {}
+      broadcast('model-progress', { state: 'ready', percent: 100, variant: v });
+    } catch (error) { broadcast('model-progress', { state: 'error', message: error instanceof Error ? error.message : String(error), variant: v }); throw error; }
     finally { modelInstallPromise = null; }
   })();
   return modelInstallPromise;
@@ -221,7 +234,7 @@ function handleAudio(data: { buffer: ArrayBuffer; capturedAt: number }) {
     return;
   }
   if (!asrWorker) return;
-  if (inFlightChunks >= 8) { droppedChunks += 1; broadcast('metrics', { droppedChunks, queuedChunks: inFlightChunks }); return; }
+  if (inFlightChunks >= 12) { droppedChunks += 1; broadcast('metrics', { droppedChunks, queuedChunks: inFlightChunks }); return; }
   inFlightChunks += 1; asrWorker.postMessage(data, [data.buffer]);
   if (mediaPreloading) { mediaCurrentMs = Math.min(data.capturedAt, mediaDurationMs); broadcast('media-progress', { currentMs: mediaCurrentMs, durationMs: mediaDurationMs, queuedChunks: inFlightChunks }); }
 }
@@ -484,7 +497,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('media:chunk', async (_e, chunk: { buffer: ArrayBuffer; capturedAt: number }) => {
     if (!chunk || !(chunk.buffer instanceof ArrayBuffer) || chunk.buffer.byteLength > 8192 || typeof chunk.capturedAt !== 'number' || !Number.isFinite(chunk.capturedAt)) throw new Error('Invalid media audio chunk.');
-    while (running && !liveSession && inFlightChunks >= 8) await new Promise((resolve) => setTimeout(resolve, 12));
+    while (running && !liveSession && inFlightChunks >= 12) await new Promise((resolve) => setTimeout(resolve, 12));
     handleAudio(chunk);
   });
   ipcMain.handle('media:finish', async () => {
