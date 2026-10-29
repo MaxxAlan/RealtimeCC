@@ -94,6 +94,11 @@ let quitting = false;
 let inFlightChunks = 0;
 let droppedChunks = 0;
 let visibleLatencies: number[] = [];
+let benchLogStream: fs.WriteStream | null = null;
+function benchLog(event: Record<string, unknown>) {
+  if (!benchLogStream) return;
+  try { benchLogStream.write(JSON.stringify({ t: Date.now(), ...event }) + '\n'); } catch { /* ignore */ }
+}
 let activeHotkey = 'CommandOrControl+Shift+C';
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
 const geminiKeyPath = () => path.join(app.getPath('userData'), 'gemini-api-key.enc');
@@ -263,7 +268,11 @@ function ensureLocalWorker(language: string): Promise<void> {
           } else commitCaption(message.text, message.startAt ?? message.capturedAt ?? Date.now(), message.endAt ?? Date.now());
         }
       }
-      if (message.type === 'caption' && running && !mediaPreloading) broadcast('caption', { final: message.partial ? '' : message.text, partial: message.partial ? message.text : '', captureAt: message.captureAt, producedAt: message.producedAt, inferenceMs: message.inferenceMs });
+      if (message.type === 'caption' && running && !mediaPreloading) {
+        const payload = { final: message.partial ? '' : message.text, partial: message.partial ? message.text : '', captureAt: message.captureAt, producedAt: message.producedAt, inferenceMs: message.inferenceMs };
+        benchLog({ type: 'caption', text: message.text, partial: !!message.partial, captureAt: message.captureAt, producedAt: message.producedAt, inferenceMs: message.inferenceMs });
+        broadcast('caption', payload);
+      }
     });
     worker.once('error', (error) => { clearTimeout(timeout); localWorkerReady = null; reject(error); if (running) { broadcast('status', { state: 'error', message: `Local ASR failed: ${error.message}` }); void stopTranscription(); } });
     worker.on('exit', (code) => { if (asrWorker === worker) asrWorker = null; localWorkerReady = null; if (running && code !== 0) broadcast('status', { state: 'error', message: `Local ASR worker exited (${code}).` }); });
@@ -277,6 +286,13 @@ async function startTranscription() {
     const key = readGeminiKey();
     if (!key) throw new Error('Add a Google AI API key before starting live cloud captions.');
     running = true; inFlightChunks = 0; droppedChunks = 0; visibleLatencies = []; liveSpeechCaptureAt = 0;
+  try {
+    const logDir = path.join(app.getPath('userData'), 'bench-logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    const logFile = path.join(logDir, `session-${Date.now()}.jsonl`);
+    benchLogStream = fs.createWriteStream(logFile, { flags: 'a' });
+    benchLog({ type: 'session_start', provider: 'local', logFile });
+  } catch { benchLogStream = null; }
     const client = new GoogleGenAI({ apiKey: key }); liveClient = client;
     broadcast('status', { state: 'connecting', message: 'Connecting to Google Live captions. System audio will be streamed to Google.' });
     try {
@@ -313,7 +329,11 @@ async function stopTranscription() {
   if (liveSession) { try { liveSession.sendRealtimeInput({ audioStreamEnd: true }); liveSession.close(); } catch { /* connection already closed */ } liveSession = null; liveClient = null; }
   asrWorker?.postMessage({ control: 'reset' });
   broadcast('metrics', { droppedChunks, queuedChunks: 0, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99) });
-  inFlightChunks = 0; broadcast('status', { state: 'stopped' });
+  inFlightChunks = 0;
+  benchLog({ type: 'session_stop', droppedChunks, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99) });
+  try { benchLogStream?.end(); } catch {}
+  benchLogStream = null;
+  broadcast('status', { state: 'stopped' });
 }
 function getPrerollSession(): PrerollSession {
   if (prerollSession) return prerollSession;
@@ -522,9 +542,11 @@ app.whenReady().then(() => {
   ipcMain.handle('audio:chunk', (_e, chunk: { buffer: ArrayBuffer; capturedAt: number }) => { if (!chunk || !(chunk.buffer instanceof ArrayBuffer) || chunk.buffer.byteLength > 8192 || typeof chunk.capturedAt !== 'number' || !Number.isFinite(chunk.capturedAt)) throw new Error('Invalid audio chunk.'); handleAudio(chunk); });
   ipcMain.on('caption:visible', (_e, payload: { captureAt: number; inferenceMs: number; producedAt: number }) => {
     if (!payload || typeof payload.captureAt !== 'number' || !Number.isFinite(payload.captureAt)) return;
-    const endToEndMs = Math.max(0, Date.now() - payload.captureAt); visibleLatencies.push(endToEndMs); if (visibleLatencies.length > 5000) visibleLatencies.shift();
+    const visibleAt = Date.now();
+    const endToEndMs = Math.max(0, visibleAt - payload.captureAt); visibleLatencies.push(endToEndMs); if (visibleLatencies.length > 5000) visibleLatencies.shift();
     const captureToInferenceMs = Math.max(0, payload.producedAt - payload.captureAt);
-    broadcast('metrics', { endToEndMs, captureToInferenceMs, bufferingMs: Math.max(0, captureToInferenceMs - payload.inferenceMs), renderMs: Math.max(0, Date.now() - payload.producedAt), inferenceMs: payload.inferenceMs, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99), droppedChunks, queuedChunks: inFlightChunks });
+    benchLog({ type: 'caption_visible', captureAt: payload.captureAt, producedAt: payload.producedAt, visibleAt, inferenceMs: payload.inferenceMs, endToEndMs });
+    broadcast('metrics', { endToEndMs, captureToInferenceMs, bufferingMs: Math.max(0, captureToInferenceMs - payload.inferenceMs), renderMs: Math.max(0, visibleAt - payload.producedAt), inferenceMs: payload.inferenceMs, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99), droppedChunks, queuedChunks: inFlightChunks });
   });
   ipcMain.handle('overlay:show', () => overlayWindow?.show()); ipcMain.handle('overlay:hide', () => overlayWindow?.hide());
   ipcMain.handle('overlay:clickthrough', (_e, on: unknown) => { if (typeof on !== 'boolean') throw new Error('Invalid click-through setting.'); overlayWindow?.setIgnoreMouseEvents(on, { forward: true }); const s = readSettings(); s.clickThrough = on; saveSettings(s); });

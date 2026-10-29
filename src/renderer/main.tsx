@@ -232,13 +232,24 @@ function App() {
       source.connect(node);
       node.connect(mute);
       mute.connect(context.destination);
+      // Keep a wall-clock anchor when the context starts so we can map
+      // AudioContext.currentTime → approximate wall time for diagnostics.
+      // This is still NOT a substitute for fixture-based E2E measurement
+      // (see docs/E2E_BENCHMARK.md). True acceptance requires external t_play0.
+      const contextEpochMs = Date.now() - context.currentTime * 1000;
       node.port.onmessage = (event) => {
-        const data: ArrayBuffer = event.data;
+        const msg = event.data as { buffer: ArrayBuffer; audioTimeSec?: number; frameIndex?: number } | ArrayBuffer;
+        const data = msg instanceof ArrayBuffer ? msg : msg.buffer;
+        const audioTimeSec = msg instanceof ArrayBuffer ? undefined : msg.audioTimeSec;
         const samples = new Int16Array(data);
         let sum = 0;
         for (let i = 0; i < samples.length; i += 8) sum += samples[i] * samples[i];
         setLevel(Math.min(100, Math.sqrt(sum / Math.ceil(samples.length / 8)) / 327.68));
-        void window.captionApi.sendAudio({ buffer: data, capturedAt: Date.now() - 80 });
+        // Prefer AudioContext-derived wall time when available; fall back to estimate.
+        const capturedAt = typeof audioTimeSec === 'number'
+          ? Math.round(contextEpochMs + audioTimeSec * 1000)
+          : Date.now() - 80;
+        void window.captionApi.sendAudio({ buffer: data, capturedAt });
       };
       for (const track of stream.getAudioTracks()) track.onended = () => void stop();
       setStartedAt(Date.now());

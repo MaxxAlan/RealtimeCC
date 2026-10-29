@@ -13,7 +13,8 @@
     "test": "vitest run",
     "bench:translate": "tsx scripts/bench-translate.ts",
     "bench:asr": "tsx scripts/bench-asr.ts",
-    "preroll:cli": "tsx scripts/preroll-cli.ts"
+    "preroll:cli": "tsx scripts/preroll-cli.ts",
+    "bench:align": "tsx scripts/align-e2e.ts"
   },
   "dependencies": {
     "@google/genai": "^2.31.0",

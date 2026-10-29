@@ -57,9 +57,13 @@ Target: P50 < 500 ms and P95 < 1000 ms from audio entering loopback capture to t
 | ASR VRAM | 0 MiB by configuration | CPU provider; total Electron GPU memory was not isolated |
 | Loopback-to-painted-overlay P50 / P95 / P99 | Not measured | Requires live loopback and ground-truth speech timestamps |
 
-Both worker-only P50 runs exceed the 500 ms target, and one P95 exceeds 1000 ms. The live loopback trial also dropped 52 chunks. These results fail the current performance acceptance criteria. The smoke runs are too small and exclude rendering, so they do not provide a qualifying end-to-end latency benchmark. The app reports diagnostic live timing and session percentiles, but those numbers must not be used as a verified end-to-end result.
+Both worker-only P50 runs exceed the 500 ms target, and one P95 exceeds 1000 ms. The live loopback trial also dropped 52 chunks. These results fail the current performance acceptance criteria. The smoke runs are too small and exclude rendering, so they do not provide a qualifying end-to-end latency benchmark.
 
-To produce a valid report, play a timestamped speech fixture through the Windows output device, record its ground-truth word start times, and collect overlay-visible timestamps over repeated runs after model warm-up. Report P50/P95/P99 end-to-end latency, WER, dropped audio chunks and VRAM. Do not substitute an offline model RTF or this worker-only smoke run for end-to-end latency.
+**Diagnostic-only numbers (do not use for acceptance or engine comparison):**
+- Worker-only / offline RTF (`scripts/bench-asr.ts`)
+- In-app session P50/P95 from `caption:visible` (based on estimated `capturedAt ≈ Date.now() - 80` at send time, not audio sample time)
+
+**Authoritative measurement:** see [`docs/E2E_BENCHMARK.md`](docs/E2E_BENCHMARK.md). Requirements: same fixture with ground-truth word onsets, playback through the Windows default endpoint, overlay-visible timestamps, then alignment with `scripts/align-e2e.ts`. Report E2E P50/P95, WER, dropped chunks, CPU, and VRAM. Until that table exists, the latency target remains **not measured** for acceptance.
 
 ## Tuning Nemotron / chunking (do this before changing engines)
 
