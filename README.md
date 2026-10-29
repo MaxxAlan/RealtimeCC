@@ -65,6 +65,10 @@ Both worker-only P50 runs exceed the 500 ms target, and one P95 exceeds 1000 ms.
 
 **Authoritative measurement:** see [`docs/E2E_BENCHMARK.md`](docs/E2E_BENCHMARK.md). Requirements: same fixture with ground-truth word onsets, playback through the Windows default endpoint, overlay-visible timestamps, then alignment with `scripts/align-e2e.ts`. Report E2E P50/P95, WER, dropped chunks, CPU, and VRAM. Until that table exists, the latency target remains **not measured** for acceptance.
 
+## GPU prototypes (Sherpa CUDA · whisper.cpp)
+
+See [`docs/GPU_PROTOTYPE.md`](docs/GPU_PROTOTYPE.md). Stock Node addon is **CPU**; CUDA is optional/`auto` with **CPU fallback**. whisper.cpp stream examples use **≥500 ms** steps — do not assume &lt;400 ms E2E without measurement.
+
 ## Tuning Nemotron / chunking (do this before changing engines)
 
 The live path currently defaults to the **80 ms** INT8 Nemotron 3.5 streaming model on CPU. Larger chunk variants trade a bit of latency for higher accuracy and lower per-chunk overhead.

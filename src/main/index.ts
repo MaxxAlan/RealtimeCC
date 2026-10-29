@@ -48,6 +48,8 @@ type Settings = {
   asrThreads: number;
   /** Coalesce 80 ms capture frames into larger IPC/inference blocks: 80 | 160 | 240. */
   asrAggregateMs: number;
+  /** cpu | cuda | auto — cuda tries GPU then falls back to cpu. Default cpu. */
+  asrProvider: string;
 };
 
 const defaults: Settings = {
@@ -74,7 +76,8 @@ const defaults: Settings = {
   },
   asrPrerollVariant: '80ms',
   asrThreads: 4,
-  asrAggregateMs: 80
+  asrAggregateMs: 80,
+  asrProvider: 'cpu'
 };
 
 let mainWindow: BrowserWindow | null = null;
@@ -134,7 +137,7 @@ function readGeminiKey() { if (!hasGeminiKey()) return ''; return safeStorage.de
 function saveSettings(value: Settings) { fs.writeFileSync(settingsPath(), JSON.stringify(value, null, 2), { mode: 0o600 }); }
 function validateSettingsPatch(patch: unknown): Partial<Settings> {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid settings update.');
-  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey', 'preroll', 'translator', 'asrPrerollVariant', 'asrThreads', 'asrAggregateMs']);
+  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey', 'preroll', 'translator', 'asrPrerollVariant', 'asrThreads', 'asrAggregateMs', 'asrProvider']);
   if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error('Unsupported settings field.');
   if (value.model !== undefined && value.model !== defaults.model) throw new Error('Unsupported transcription model.');
   if (value.provider !== undefined && value.provider !== 'local' && value.provider !== 'gemini') throw new Error('Unsupported speech provider.');
@@ -170,6 +173,11 @@ function validateSettingsPatch(patch: unknown): Partial<Settings> {
     if (![80, 160, 240].includes(Number(value.asrAggregateMs)))
       throw new Error('asrAggregateMs must be 80, 160 or 240.');
     value.asrAggregateMs = Number(value.asrAggregateMs);
+  }
+  if (value.asrProvider !== undefined) {
+    const p = String(value.asrProvider).toLowerCase();
+    if (!['cpu', 'cuda', 'auto'].includes(p)) throw new Error('asrProvider must be cpu, cuda or auto.');
+    value.asrProvider = p;
   }
   return value as Partial<Settings>;
 }
@@ -296,12 +304,20 @@ function handleAudio(data: { buffer: ArrayBuffer; capturedAt: number }) {
 function ensureLocalWorker(language: string): Promise<void> {
   if (asrWorker) { asrWorker.postMessage({ control: 'configure', language: nemotronLanguage(language) }); return localWorkerReady ?? Promise.resolve(); }
   if (localWorkerReady) return localWorkerReady;
-  const worker = new Worker(path.join(__dirname, 'asr-worker.js'), { workerData: { modelDir: modelPath(), language: nemotronLanguage(language), numThreads: readSettings().asrThreads || 4 } });
+  const worker = new Worker(path.join(__dirname, 'asr-worker.js'), { workerData: { modelDir: modelPath(), language: nemotronLanguage(language), numThreads: readSettings().asrThreads || 4, provider: readSettings().asrProvider || 'cpu' } });
   asrWorker = worker;
   localWorkerReady = new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => { localWorkerReady = null; if (asrWorker === worker) asrWorker = null; void worker.terminate(); reject(new Error('The local model did not finish loading in time.')); }, 120000);
     worker.on('message', (message) => {
       if (message.type === 'ready') { clearTimeout(timeout); broadcast('status', { state: running ? 'connected' : 'stopped', message: 'Local speech model is loaded and warm.' }); resolve(); }
+      if (message.type === 'provider_fallback') {
+        broadcast('status', { state: 'warning', message: `ASR CUDA unavailable (${message.message || 'error'}); using CPU.` });
+        benchLog({ type: 'provider_fallback', from: message.from, to: message.to, message: message.message });
+      }
+      if (message.type === 'ready' && message.provider) {
+        benchLog({ type: 'asr_ready', provider: message.provider, requestedProvider: message.requestedProvider, fallback: message.fallback });
+        if (message.provider === 'cuda') broadcast('status', { state: 'connected', message: 'Local ASR provider: CUDA' });
+      }
       if (message.type === 'processed') {
         inFlightChunks = Math.max(0, inFlightChunks - 1);
         inFlightAudioMs = Math.max(0, inFlightAudioMs - (Number(message.audioMs) || 80));

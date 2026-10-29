@@ -2,21 +2,51 @@ import { parentPort, workerData } from 'node:worker_threads';
 import path from 'node:path';
 
 const dir = workerData.modelDir as string;
+const requestedProvider = String(workerData.provider || 'cpu').toLowerCase(); // cpu | cuda | auto
+const numThreads = Number(workerData.numThreads ?? 4);
 const sherpa = require('sherpa-onnx-node');
-const recognizer = new sherpa.OnlineRecognizer({
-  featConfig: { sampleRate: 16000, featureDim: 128 },
-  modelConfig: {
-    transducer: {
-      encoder: path.join(dir, 'encoder.int8.onnx'),
-      decoder: path.join(dir, 'decoder.int8.onnx'),
-      joiner: path.join(dir, 'joiner.int8.onnx'),
+
+function createRecognizer(provider: string) {
+  return new sherpa.OnlineRecognizer({
+    featConfig: { sampleRate: 16000, featureDim: 128 },
+    modelConfig: {
+      transducer: {
+        encoder: path.join(dir, 'encoder.int8.onnx'),
+        decoder: path.join(dir, 'decoder.int8.onnx'),
+        joiner: path.join(dir, 'joiner.int8.onnx'),
+      },
+      tokens: path.join(dir, 'tokens.txt'),
+      numThreads,
+      provider,
+      debug: 0,
     },
-    tokens: path.join(dir, 'tokens.txt'),
-    numThreads: Number(workerData.numThreads ?? 4),
-    provider: 'cpu',
-    debug: 0,
-  },
-});
+  });
+}
+
+/** Try CUDA when requested; always keep CPU as fallback. GPU is unverified on this machine. */
+function initRecognizer(): { recognizer: any; provider: string; fallback?: string } {
+  const wantCuda = requestedProvider === 'cuda' || requestedProvider === 'auto';
+  if (wantCuda) {
+    try {
+      const r = createRecognizer('cuda');
+      // Touch createStream to surface delayed LoadLibrary failures early.
+      const s = r.createStream();
+      try {
+        r.reset(s);
+      } catch {
+        /* ignore */
+      }
+      return { recognizer: r, provider: 'cuda' };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      parentPort?.postMessage({ type: 'provider_fallback', from: 'cuda', to: 'cpu', message: msg });
+    }
+  }
+  return { recognizer: createRecognizer('cpu'), provider: 'cpu', fallback: wantCuda ? 'cuda_failed' : undefined };
+}
+
+const boot = initRecognizer();
+const recognizer = boot.recognizer;
 const stream = recognizer.createStream();
 const requestedLanguage = String(workerData.language ?? 'auto');
 stream.setOption('language', requestedLanguage);
@@ -24,7 +54,13 @@ let lastText = '';
 let acceptedSamples = 0;
 let utteranceCaptureStartAt = 0;
 
-parentPort?.postMessage({ type: 'ready' });
+parentPort?.postMessage({
+  type: 'ready',
+  provider: boot.provider,
+  requestedProvider,
+  fallback: boot.fallback || null,
+});
+
 parentPort?.on('message', (message: {
   buffer?: ArrayBuffer;
   capturedAt?: number;
@@ -56,9 +92,6 @@ parentPort?.on('message', (message: {
   if (result.text !== lastText) {
     const text = result.text.trim();
     const endpoint = recognizer.isEndpoint(stream);
-    // Avoid flashing an unreadable one-character prefix on every decoder
-    // update. A complete word appears at its next boundary, and one-word
-    // utterances still appear when the recognizer detects their endpoint.
     if (text && (endpoint || /\s|\p{P}/u.test(result.text))) {
       const newestTokenTime = result.timestamps?.length
         ? result.timestamps[result.timestamps.length - 1] * 1000
@@ -72,6 +105,7 @@ parentPort?.on('message', (message: {
         startAt: utteranceCaptureStartAt,
         endAt: utteranceCaptureStartAt + Math.max(newestTokenTime, acceptedSamples / 16),
         producedAt: now,
+        provider: boot.provider,
       });
       lastText = result.text;
     }
@@ -97,5 +131,6 @@ parentPort?.on('message', (message: {
     capturedAt: message.capturedAt,
     producedAt: now,
     audioMs,
+    provider: boot.provider,
   });
 });
