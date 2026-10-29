@@ -43,10 +43,20 @@ Options:
   --wav <path>         16 kHz mono test WAV
   --threads <n>        Thread count (default: cpus-2)
   --lang <code>        Language code (default: vi)
-  --chunk-ms <n>       Simulated live chunk size in ms (default: 80)
+  --chunk-ms <n>       Feed size in ms (default: 80). Use 160 or 240 to simulate
+                       main-process aggregation (fewer IPC/decode calls, later partials).
   --runs <n>           Full runs after warm-up (default: 3)
   --queue-limit <n>    Simulated in-flight drop limit (default: 8)
   --help
+
+Sweep tip (on the target machine, after models are downloaded):
+  for v in 80 160 560 1120; do
+    for t in 2 4 6; do
+      for c in 80 160 240; do
+        npx tsx scripts/bench-asr.ts --variant $v --threads $t --chunk-ms $c --runs 2
+      done
+    done
+  done
 `;
 
 function getArg(flag: string): string | undefined {

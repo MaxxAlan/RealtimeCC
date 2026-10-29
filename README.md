@@ -90,11 +90,26 @@ npx tsx scripts/bench-asr.ts --variant 1120 --threads 4
 
 Reports RTF, first-partial latency, per-chunk inference P50/P95, and simulated drop rate under a live-like 80 ms feed. JSON reports land in `bench-cache/`.
 
-**Settings:** `asrPrerollVariant` accepts `80ms` | `160ms` | `560ms` | `1120ms`. Changing it requires the matching model files; the download path follows the selected variant.
+**Settings (local ASR path):**
+- `asrPrerollVariant`: `80ms` | `160ms` | `560ms` | `1120ms` (model files must match)
+- `asrThreads`: CPU threads for sherpa-onnx (default 4; try 2–6 on a 6-core laptop)
+- `asrAggregateMs`: `80` | `160` | `240` — coalesce capture frames before IPC/inference. Larger values cut IPC and decode calls but delay the first partial of each block. Trade-off experiment, not a free lunch.
 
-**Queue:** live in-flight limit raised from 8 → 12 chunks to reduce artificial drops while the recognizer is briefly busy.
+**Queue:** bounded by **audio duration in flight** (max 960 ms), not an unbounded message pile. Drops when the engine falls behind real time — the goal is RTF &lt; 1 (process faster than audio), not raising the limit to hide lag.
 
-Only after solid E2E numbers (loopback → overlay paint) on the target machine should CUDA Sherpa or whisper.cpp prototypes be started. Otherwise the bottleneck remains unmeasured.
+**Suggested sweep on the target PC** (worker-only, still not E2E acceptance):
+
+```powershell
+foreach ($v in 80,160,560,1120) {
+  foreach ($t in 2,4,6) {
+    foreach ($c in 80,160,240) {
+      npx tsx scripts/bench-asr.ts --variant $v --threads $t --chunk-ms $c --runs 2
+    }
+  }
+}
+```
+
+Pick the best (variant, threads, aggregate) by RTF and first-partial, then confirm with the fixture E2E protocol in `docs/E2E_BENCHMARK.md`. Only after that should CUDA Sherpa or whisper.cpp prototypes start.
 
 ## Actual machine inspected
 

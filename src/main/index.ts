@@ -44,6 +44,10 @@ type Settings = {
   preroll: PrerollSettings;
   translator: TranslatorSettings;
   asrPrerollVariant: string;
+  /** CPU threads for sherpa-onnx (1..logicalCores). Default 4. */
+  asrThreads: number;
+  /** Coalesce 80 ms capture frames into larger IPC/inference blocks: 80 | 160 | 240. */
+  asrAggregateMs: number;
 };
 
 const defaults: Settings = {
@@ -68,7 +72,9 @@ const defaults: Settings = {
     quant: 'Q4_K_M',
     gpu: 'auto'
   },
-  asrPrerollVariant: '80ms'
+  asrPrerollVariant: '80ms',
+  asrThreads: 4,
+  asrAggregateMs: 80
 };
 
 let mainWindow: BrowserWindow | null = null;
@@ -92,7 +98,12 @@ let sessionTimelineStart = Date.now();
 let running = false;
 let quitting = false;
 let inFlightChunks = 0;
+let inFlightAudioMs = 0;
 let droppedChunks = 0;
+/** Max audio duration allowed in-flight to the worker (keeps latency bounded). */
+const MAX_IN_FLIGHT_AUDIO_MS = 960;
+type AggBuf = { parts: Int16Array[]; capturedAt: number; samples: number };
+let aggBuf: AggBuf | null = null;
 let visibleLatencies: number[] = [];
 let benchLogStream: fs.WriteStream | null = null;
 function benchLog(event: Record<string, unknown>) {
@@ -123,7 +134,7 @@ function readGeminiKey() { if (!hasGeminiKey()) return ''; return safeStorage.de
 function saveSettings(value: Settings) { fs.writeFileSync(settingsPath(), JSON.stringify(value, null, 2), { mode: 0o600 }); }
 function validateSettingsPatch(patch: unknown): Partial<Settings> {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid settings update.');
-  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey', 'preroll', 'translator', 'asrPrerollVariant']);
+  const value = patch as Record<string, unknown>; const allowed = new Set(['model', 'provider', 'language', 'outputLanguage', 'fontSize', 'opacity', 'historySeconds', 'clickThrough', 'hotkey', 'preroll', 'translator', 'asrPrerollVariant', 'asrThreads', 'asrAggregateMs']);
   if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error('Unsupported settings field.');
   if (value.model !== undefined && value.model !== defaults.model) throw new Error('Unsupported transcription model.');
   if (value.provider !== undefined && value.provider !== 'local' && value.provider !== 'gemini') throw new Error('Unsupported speech provider.');
@@ -151,6 +162,15 @@ function validateSettingsPatch(patch: unknown): Partial<Settings> {
     if (t.gpu !== undefined && t.gpu !== 'auto' && t.gpu !== 'off') throw new Error('Invalid translator gpu setting.');
   }
   if (value.asrPrerollVariant !== undefined) { const v = String(value.asrPrerollVariant).toLowerCase(); if (!['80ms','160ms','560ms','1120ms'].includes(v)) throw new Error('ASR variant must be 80ms, 160ms, 560ms or 1120ms.'); value.asrPrerollVariant = v; }
+  if (value.asrThreads !== undefined) {
+    if (typeof value.asrThreads !== 'number' || !Number.isInteger(value.asrThreads) || value.asrThreads < 1 || value.asrThreads > 32)
+      throw new Error('asrThreads must be an integer between 1 and 32.');
+  }
+  if (value.asrAggregateMs !== undefined) {
+    if (![80, 160, 240].includes(Number(value.asrAggregateMs)))
+      throw new Error('asrAggregateMs must be 80, 160 or 240.');
+    value.asrAggregateMs = Number(value.asrAggregateMs);
+  }
   return value as Partial<Settings>;
 }
 function broadcast(channel: string, data: unknown) { for (const win of [mainWindow, overlayWindow]) if (win && !win.isDestroyed()) win.webContents.send(channel, data); }
@@ -228,6 +248,32 @@ function installModel(variant?: string): Promise<void> {
   })();
   return modelInstallPromise;
 }
+function flushAggregate(force = false) {
+  if (!aggBuf || !asrWorker) return;
+  const targetSamples = Math.round(16000 * (readSettings().asrAggregateMs || 80) / 1000);
+  if (!force && aggBuf.samples < targetSamples) return;
+  const total = aggBuf.samples;
+  const merged = new Int16Array(total);
+  let off = 0;
+  for (const p of aggBuf.parts) { merged.set(p, off); off += p.length; }
+  const audioMs = Math.round(total / 16);
+  const capturedAt = aggBuf.capturedAt;
+  aggBuf = null;
+  if (inFlightAudioMs + audioMs > MAX_IN_FLIGHT_AUDIO_MS) {
+    droppedChunks += 1;
+    benchLog({ type: 'drop', reason: 'in_flight_audio_ms', inFlightAudioMs, audioMs, droppedChunks });
+    broadcast('metrics', { droppedChunks, queuedChunks: inFlightChunks, inFlightAudioMs });
+    return;
+  }
+  inFlightChunks += 1;
+  inFlightAudioMs += audioMs;
+  asrWorker.postMessage({ buffer: merged.buffer, capturedAt, audioMs }, [merged.buffer]);
+  if (mediaPreloading) {
+    mediaCurrentMs = Math.min(capturedAt, mediaDurationMs);
+    broadcast('media-progress', { currentMs: mediaCurrentMs, durationMs: mediaDurationMs, queuedChunks: inFlightChunks });
+  }
+}
+
 function handleAudio(data: { buffer: ArrayBuffer; capturedAt: number }) {
   if (!running) return;
   if (liveSession) {
@@ -239,20 +285,29 @@ function handleAudio(data: { buffer: ArrayBuffer; capturedAt: number }) {
     return;
   }
   if (!asrWorker) return;
-  if (inFlightChunks >= 12) { droppedChunks += 1; broadcast('metrics', { droppedChunks, queuedChunks: inFlightChunks }); return; }
-  inFlightChunks += 1; asrWorker.postMessage(data, [data.buffer]);
-  if (mediaPreloading) { mediaCurrentMs = Math.min(data.capturedAt, mediaDurationMs); broadcast('media-progress', { currentMs: mediaCurrentMs, durationMs: mediaDurationMs, queuedChunks: inFlightChunks }); }
+  const pcm = new Int16Array(data.buffer.slice(0));
+  if (!aggBuf) aggBuf = { parts: [], capturedAt: data.capturedAt, samples: 0 };
+  aggBuf.parts.push(pcm);
+  aggBuf.samples += pcm.length;
+  // Keep earliest capture time for the aggregated block (onset of the first frame).
+  if (data.capturedAt < aggBuf.capturedAt) aggBuf.capturedAt = data.capturedAt;
+  flushAggregate(false);
 }
 function ensureLocalWorker(language: string): Promise<void> {
   if (asrWorker) { asrWorker.postMessage({ control: 'configure', language: nemotronLanguage(language) }); return localWorkerReady ?? Promise.resolve(); }
   if (localWorkerReady) return localWorkerReady;
-  const worker = new Worker(path.join(__dirname, 'asr-worker.js'), { workerData: { modelDir: modelPath(), language: nemotronLanguage(language) } });
+  const worker = new Worker(path.join(__dirname, 'asr-worker.js'), { workerData: { modelDir: modelPath(), language: nemotronLanguage(language), numThreads: readSettings().asrThreads || 4 } });
   asrWorker = worker;
   localWorkerReady = new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => { localWorkerReady = null; if (asrWorker === worker) asrWorker = null; void worker.terminate(); reject(new Error('The local model did not finish loading in time.')); }, 120000);
     worker.on('message', (message) => {
       if (message.type === 'ready') { clearTimeout(timeout); broadcast('status', { state: running ? 'connected' : 'stopped', message: 'Local speech model is loaded and warm.' }); resolve(); }
-      if (message.type === 'processed') { inFlightChunks = Math.max(0, inFlightChunks - 1); broadcast('metrics', { captureToInferenceMs: Math.max(0, message.producedAt - message.capturedAt), inferenceMs: message.inferenceMs, queuedChunks: inFlightChunks, droppedChunks }); if (mediaPreloading) broadcast('media-progress', { currentMs: mediaCurrentMs, durationMs: mediaDurationMs, queuedChunks: inFlightChunks }); }
+      if (message.type === 'processed') {
+        inFlightChunks = Math.max(0, inFlightChunks - 1);
+        inFlightAudioMs = Math.max(0, inFlightAudioMs - (Number(message.audioMs) || 80));
+        broadcast('metrics', { captureToInferenceMs: Math.max(0, message.producedAt - message.capturedAt), inferenceMs: message.inferenceMs, queuedChunks: inFlightChunks, inFlightAudioMs, droppedChunks });
+        if (mediaPreloading) broadcast('media-progress', { currentMs: mediaCurrentMs, durationMs: mediaDurationMs, queuedChunks: inFlightChunks });
+      }
       if (message.type === 'final' && message.text) {
         if (mediaPreloading) mediaCues.push({ startMs: message.startAt ?? 0, endMs: Math.max(message.endAt ?? 0, (message.startAt ?? 0) + 250), text: message.text });
         else {
@@ -285,7 +340,7 @@ async function startTranscription() {
   if (settings.provider === 'gemini') {
     const key = readGeminiKey();
     if (!key) throw new Error('Add a Google AI API key before starting live cloud captions.');
-    running = true; inFlightChunks = 0; droppedChunks = 0; visibleLatencies = []; liveSpeechCaptureAt = 0;
+    running = true; inFlightChunks = 0; inFlightAudioMs = 0; droppedChunks = 0; visibleLatencies = []; liveSpeechCaptureAt = 0; aggBuf = null;
   try {
     const logDir = path.join(app.getPath('userData'), 'bench-logs');
     fs.mkdirSync(logDir, { recursive: true });
@@ -320,14 +375,14 @@ async function startTranscription() {
   if (!modelInstalled()) throw new Error('Download the local speech model before starting.');
   if (settings.outputLanguage !== 'same') { if (!translatorInstalled()) throw new Error('Download the local translator model before starting.'); const src = settings.language === 'auto' ? 'en' : (toTranslateGemmaCode(settings.language) || 'en'); const tgt = toTranslateGemmaCode(settings.outputLanguage); if (!tgt || !isSupportedPair(src, tgt)) throw new Error('That language pair is not supported by the local translator.'); await ensureTranslator(); }
   if (settings.language !== 'auto' && !localReadyLanguages.has(settings.language)) throw new Error('That language is not available with the local model. Choose a local-ready language or select Google Live captions.');
-  running = true; inFlightChunks = 0; droppedChunks = 0; visibleLatencies = [];
+  running = true; inFlightChunks = 0; inFlightAudioMs = 0; droppedChunks = 0; visibleLatencies = []; aggBuf = null;
   broadcast('status', { state: 'connecting', message: 'Loading local speech model.' });
   await ensureLocalWorker(settings.language);
 }
 async function stopTranscription() {
   running = false;
   if (liveSession) { try { liveSession.sendRealtimeInput({ audioStreamEnd: true }); liveSession.close(); } catch { /* connection already closed */ } liveSession = null; liveClient = null; }
-  asrWorker?.postMessage({ control: 'reset' });
+  flushAggregate(true); asrWorker?.postMessage({ control: 'reset' });
   broadcast('metrics', { droppedChunks, queuedChunks: 0, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99) });
   inFlightChunks = 0;
   benchLog({ type: 'session_stop', droppedChunks, p50Ms: percentile(visibleLatencies, .5), p95Ms: percentile(visibleLatencies, .95), p99Ms: percentile(visibleLatencies, .99) });
@@ -516,7 +571,7 @@ app.whenReady().then(() => {
     try { await startTranscription(); return true; } catch (error) { mediaPreloading = false; throw error; }
   });
   ipcMain.handle('media:chunk', async (_e, chunk: { buffer: ArrayBuffer; capturedAt: number }) => {
-    if (!chunk || !(chunk.buffer instanceof ArrayBuffer) || chunk.buffer.byteLength > 8192 || typeof chunk.capturedAt !== 'number' || !Number.isFinite(chunk.capturedAt)) throw new Error('Invalid media audio chunk.');
+    if (!chunk || !(chunk.buffer instanceof ArrayBuffer) || chunk.buffer.byteLength > 16384 || typeof chunk.capturedAt !== 'number' || !Number.isFinite(chunk.capturedAt)) throw new Error('Invalid media audio chunk.');
     while (running && !liveSession && inFlightChunks >= 12) await new Promise((resolve) => setTimeout(resolve, 12));
     handleAudio(chunk);
   });
@@ -539,7 +594,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('media:cancel', async () => { mediaPreloading = false; mediaCues = []; await stopTranscription(); return true; });
   ipcMain.on('media:caption', (_e, text: unknown) => { if (typeof text !== 'string' || text.length > 2000) return; broadcast('caption', { final: text, partial: '', source: 'media' }); });
-  ipcMain.handle('audio:chunk', (_e, chunk: { buffer: ArrayBuffer; capturedAt: number }) => { if (!chunk || !(chunk.buffer instanceof ArrayBuffer) || chunk.buffer.byteLength > 8192 || typeof chunk.capturedAt !== 'number' || !Number.isFinite(chunk.capturedAt)) throw new Error('Invalid audio chunk.'); handleAudio(chunk); });
+  ipcMain.handle('audio:chunk', (_e, chunk: { buffer: ArrayBuffer; capturedAt: number }) => { if (!chunk || !(chunk.buffer instanceof ArrayBuffer) || chunk.buffer.byteLength > 16384 || typeof chunk.capturedAt !== 'number' || !Number.isFinite(chunk.capturedAt)) throw new Error('Invalid audio chunk.'); handleAudio(chunk); });
   ipcMain.on('caption:visible', (_e, payload: { captureAt: number; inferenceMs: number; producedAt: number }) => {
     if (!payload || typeof payload.captureAt !== 'number' || !Number.isFinite(payload.captureAt)) return;
     const visibleAt = Date.now();
